@@ -35,10 +35,13 @@ import psutil  # noqa: E402
 
 # tskmngr bir symlink: kardes modulleri (tm_*.py) gercek dosyanin yanindan al
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import tm_alerts  # noqa: E402
+import tm_profiles  # noqa: E402
 import tm_services  # noqa: E402
 from tm_history import DEFAULT_DAYS, SYS_EVERY, History, Recorder, psi_some10, read_psi  # noqa: E402
 from tm_procfs import HelperError, PrivHelper, find_owners, listening_sockets, read_stats  # noqa: E402
 
+VERSION = "1.0.0"
 APP_ID = "tr.teginsoft.TaskMgr"
 NCPU = psutil.cpu_count() or 1
 ME = os.getuid()
@@ -49,7 +52,7 @@ HISTORY = 60  # grafikte saniye
 OLD_TABS = [0, 1, 3, 4, 5, 6]  # ayar dosyasi version 1: sekme sirasi (Gecmis/Servisler yoktu)
 STUCK_SECS = 6  # disk beklemesinde (D) bu kadar saniye kalan surec 'takili' sayilir
 
-DOTNET_RX = re.compile(r"dotnet|MSBuild|VBCSCompiler|testhost|OmniSharp|Microsoft\.CodeAnalysis", re.I)
+ACTIVE = tm_profiles.Active(tm_profiles.DEFAULT_PROFILES)  # secili gelistirme profilleri (TaskManager gunceller)
 MSBUILD_NODE_RX = re.compile(r"MSBuild\.dll.*nodeReuse:true")
 PORT_QUERY_RX = re.compile(r"^(?::|port:?\s*)(\d{1,5})$", re.I)
 PROJECT_QUERY_RX = re.compile(r"^proje:(.*)$", re.I)
@@ -60,7 +63,7 @@ STATUS_TR = {"running": "çalışıyor", "sleeping": "uyuyor", "disk-sleep": "di
              "dead": "ölü", "wake-kill": "uyanıyor", "waking": "uyanıyor", "parked": "park"}
 
 (COL_PID, COL_NAME, COL_CPU, COL_RSS, COL_THR, COL_USER, COL_STARTED, COL_CMD,
- COL_CWD, COL_STATUS, COL_PPID, COL_DOTNET, COL_SEARCH, COL_PORTS, COL_PORTNUMS, COL_PSS, COL_NICE,
+ COL_CWD, COL_STATUS, COL_PPID, COL_DEV, COL_SEARCH, COL_PORTS, COL_PORTNUMS, COL_PSS, COL_NICE,
  COL_IOR, COL_IOW) = range(19)
 COL_TYPES = [int, str, float, GObject.TYPE_INT64, int, str, float, str, str, str, int, bool, str, str, str,
              GObject.TYPE_INT64, int, GObject.TYPE_INT64, GObject.TYPE_INT64]
@@ -69,7 +72,7 @@ COL_TYPES = [int, str, float, GObject.TYPE_INT64, int, str, float, str, str, str
  D_PORTS, D_SEARCH, D_LIMIT) = range(14)
 D_TYPES = [str, str, str, str, str, str, float, GObject.TYPE_INT64, str, str, int, str, str, GObject.TYPE_INT64]
 
-(P_ROOT, P_NAME, P_PATH, P_COUNT, P_CPU, P_MEM, P_DOTNET, P_BRANCH, P_DIRTY) = range(9)
+(P_ROOT, P_NAME, P_PATH, P_COUNT, P_CPU, P_MEM, P_DEV, P_BRANCH, P_DIRTY) = range(9)
 P_TYPES = [str, str, str, int, float, GObject.TYPE_INT64, int, str, int]
 
 (N_KEY, N_PROTO, N_PORT, N_ADDR, N_PID, N_NAME, N_USER, N_PROJECT, N_DOCKER, N_CMD, N_SEARCH) = range(11)
@@ -88,14 +91,18 @@ PROTECTED_SERVICES = ("dbus.service", "dbus-broker.service", "gnome-session", "g
 
 # kullanici tercihleri (Ayarlar penceresi). settings.json'da ayni anahtarlarla saklanir
 PREFS = dict(log_enabled=True, log_days=DEFAULT_DAYS, stall_psi=25, bg_run=True, notify_mem=True, notify_mem_pct=90,
-             auto_idle=False, auto_idle_min=10, auto_idle_mem=75)
+             auto_idle=False, auto_idle_min=10, auto_idle_mem=75, notify_stall=True, notify_disk=True,
+             notify_disk_pct=90)
 PREF_RANGE = dict(log_days=(1, 365), stall_psi=(5, 95), notify_mem_pct=(50, 99), auto_idle_min=(1, 240),
-                  auto_idle_mem=(0, 99))
+                  auto_idle_mem=(0, 99), notify_disk_pct=(50, 99))
 MEM_NOTE_COOLDOWN = 600  # sn: bellek uyarisi en sik bu aralikla
+STALL_TICKS = 5           # baski bu kadar saniye ust uste esigin ustunde kalirsa takilma bildirimi
+STALL_NOTE_COOLDOWN = 300
+DISK_CHECK_EVERY = 60
+DISK_NOTE_COOLDOWN = 6 * 3600
 HISTORY_RANGES = [("Son 15 dakika", 900), ("Son 1 saat", 3600), ("Son 6 saat", 6 * 3600),
                   ("Son 24 saat", 86400), ("Son 7 gün", 7 * 86400), ("Tümü", 0)]
 CAUSE_TR = {"cpu": "CPU", "mem": "Bellek", "io": "Disk"}
-CLEAN_NAMES = {"bin", "obj", "node_modules", "target"}  # sadece bunlar silinebilir
 DEFAULT_CLEAN_ROOTS = [os.path.join(HOME, "Desktop", "GitRepos")]
 
 DOCKER_STATES = {
@@ -257,7 +264,7 @@ def collect(show_all):
                     "raw_name": st[1], "name": st[2], "user": st[3], "cmd": st[4], "cwd": st[5],
                     "cpu_raw": cpu_raw, "cpu": cpu_raw / NCPU,
                     "rss": p.memory_info().rss, "threads": p.num_threads(), "status": p.status(),
-                    "dotnet": bool(DOTNET_RX.search(st[4]) or DOTNET_RX.search(st[1])),
+                    "dev": ACTIVE.is_dev(st[4], st[1]),
                 })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -506,29 +513,43 @@ def docker_port_map():
     return mapping
 
 
-def scan_clean(roots):
-    """roots altinda yeniden uretilebilir klasorler: .NET bin/obj, node_modules, target. -> [(yol, proje, tur)]"""
+def git_ignored(path):
+    """path git tarafindan yok sayiliyor mu? (git deposu degilse False)"""
+    try:
+        res = subprocess.run(["git", "-C", os.path.dirname(path), "check-ignore", "-q", "--", os.path.basename(path)],
+                             capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return res.returncode == 0
+
+
+def scan_clean(roots, active=None):
+    """roots altinda yeniden uretilebilir klasorler (secili profillerin kurallarina gore). -> [(yol, proje, tur)]"""
+    active = active or ACTIVE
+    names = active.clean_names
     found = []
     for root in roots:
         root = os.path.expanduser(root)
         for dirpath, dirnames, filenames in os.walk(root):
+            if "pyvenv.cfg" in filenames:  # sanal ortam: icine girme
+                dirnames[:] = []
+                continue
             depth = dirpath[len(root):].count(os.sep)
             has = set(filenames)
             keep = []
             for dn in dirnames:
                 full = os.path.join(dirpath, dn)
-                if os.path.islink(full) or dn.startswith(".") or dn == "node_modules" and "package.json" not in has:
+                if os.path.islink(full):
                     continue
-                kind = None
-                if dn == "node_modules":
-                    kind = "node_modules"
-                elif dn in ("bin", "obj") and any(f.endswith((".csproj", ".fsproj", ".vbproj")) for f in has):
-                    kind = ".NET " + dn
-                elif dn == "target" and ("Cargo.toml" in has or "pom.xml" in has):
-                    kind = "target (Rust/Maven)"
+                kind = active.match_clean(dn, has) if dn in names else None
+                if kind and active.needs_ignore(dn) and not git_ignored(full):
+                    kind = None  # 'build' / 'dist' gibi genel adlar: yalnizca .gitignore'daysa
+                    continue
                 if kind:
                     proj = project_root(full)
                     found.append((full, os.path.basename(proj) if proj else os.path.basename(dirpath), kind))
+                elif dn.startswith(".") or dn == "node_modules":
+                    continue
                 else:
                     keep.append(dn)
             dirnames[:] = keep if depth < 6 else []
@@ -573,13 +594,17 @@ def busy_dirs(paths):
     return busy
 
 
-def safe_delete(path, roots):
-    """Yalnizca taranan klasorlerin altindaki bin/obj/node_modules/target silinir. -> (ok, hata)"""
-    if os.path.islink(path) or os.path.basename(path) not in CLEAN_NAMES:
+def safe_delete(path, roots, active=None):
+    """Yalnizca taranan klasorlerin altinda, secili profillerin temizlik adlarindan biri silinir. -> (ok, hata)"""
+    active = active or ACTIVE
+    name = os.path.basename(path)
+    if os.path.islink(path) or name not in active.clean_names:
         return False, "güvenlik: beklenmeyen klasör"
     real = os.path.realpath(path)
     if not any(real.startswith(os.path.realpath(os.path.expanduser(r)).rstrip("/") + "/") for r in roots):
         return False, "taranan klasörlerin dışında"
+    if active.needs_ignore(name) and not git_ignored(real):
+        return False, "git tarafından yok sayılmıyor (.gitignore'da değil)"
     if tracked_dirs([real]):
         return False, "git'te izlenen dosyalar içeriyor"
     try:
@@ -1100,7 +1125,8 @@ class TaskManager:
         st = self.settings
         self.win = None
         self.show_all_users = bool(st.get("all_users", False))
-        self.dotnet_only = bool(st.get("dotnet_only", False))
+        self.profiles = tm_profiles.load_profiles()
+        self.dev_only = bool(st.get("dev_only", st.get("dotnet_only", False)))
         self.tree_mode = bool(st.get("tree_mode", False))
         self.docker_all = bool(st.get("docker_all", True))
         self.paused = False
@@ -1150,6 +1176,15 @@ class TaskManager:
         self.svc_iters = {}
         self.svc_query = ""
         self.svc_busy = False
+        self.shutdown_box = None
+        self.stall_ticks = 0
+        self.stall_note_t = -STALL_NOTE_COOLDOWN
+        self.disk_note_t = {}     # yol -> son bildirim (time.time)
+        self.disk_check_t = 0.0
+        self.last_swap = None     # (sin, sout, monotonic)
+        self.first_run_profiles = "profiles" not in self.settings
+        self.chooser = None
+        self.apply_profiles(self.profile_ids(), save=False)
         try:
             self.history = History()
         except (sqlite3.Error, OSError) as e:
@@ -1187,6 +1222,7 @@ class TaskManager:
         btn_settings.show()
         self.root.set_action_widget(btn_settings, Gtk.PackType.END)
         self.root.connect("switch-page", self.on_switch_page)
+        self.update_profile_labels()
         self.refresh_processes()
         GLib.timeout_add(1000, self.tick)
 
@@ -1207,17 +1243,65 @@ class TaskManager:
         self.settings[key] = value
         self.save_settings(self.win)
 
+    # -------------------------------------------------------------- korunan surecler
+    def protect_patterns(self):
+        return tm_alerts.clean_patterns(self.settings.get("protect"))
+
+    def is_protected(self, r):
+        """r: surec satiri (name, cmd, pid). Kalip ad / komut / proje adi ya da yolunda gecerse korunur."""
+        pats = self.protect_patterns()
+        if not pats:
+            return False
+        return tm_alerts.is_protected(pats, r["name"], r["cmd"], self.proc_project.get(r["pid"]) or "")
+
+    # -------------------------------------------------------------- profiller
+    def profile_ids(self):
+        v = self.settings.get("profiles")
+        ids = [i for i in v if isinstance(i, str) and i in self.profiles] if isinstance(v, list) else None
+        return ids if ids is not None else list(tm_profiles.DEFAULT_PROFILES)
+
+    def apply_profiles(self, ids, save=True):
+        """Profil secimini uygular: sureç filtresi, bosta artiklar, temizlik kurallari yeniden hesaplanir."""
+        global ACTIVE
+        ACTIVE = tm_profiles.Active(ids, self.profiles)
+        self.settings["profiles"] = list(ACTIVE.ids)
+        if not hasattr(self, "btn_dev"):
+            return
+        self.update_profile_labels()
+        self.clean_scanned = False
+        if self.root.get_current_page() == TAB_CLEAN:
+            self.clean_scan()
+        self.refresh_processes()
+        self.fill_shutdown_box()
+        if save:
+            self.save_settings(self.win)
+
+    def profile_summary(self):
+        return " + ".join(ACTIVE.names) or "profil seçilmedi"
+
+    def update_profile_labels(self):
+        self.btn_dev.set_tooltip_text(f"Yalnızca geliştirme süreçlerini göster ({self.profile_summary()})")
+        labels = ", ".join(l for l, _rx in ACTIVE.idle_rules) or "yok"
+        self.btn_idle.set_tooltip_text(f"Boşta bekleyen artıkları kapatır: {labels}")
+        self.btn_idle.set_sensitive(bool(ACTIVE.idle_rules))
+
     def log_event(self, kind, text):
         if self.history is not None and self.pref("log_enabled"):
             self.history.add_event(time.time(), kind, text)
 
-    def notify(self, title, body):
-        """Masaustu bildirimi (sistem tepsisi yok). Gio.Notification, olmazsa notify-send."""
+    def notify(self, title, body, buttons=()):
+        """Masaustu bildirimi (sistem tepsisi yok). Gio.Notification, olmazsa notify-send (dugmesiz).
+        buttons: [(etiket, 'app.eylem', GLib.Variant | None)]"""
         app = Gio.Application.get_default()
         try:
             if app is not None and app.get_is_registered():
                 n = Gio.Notification.new(title)
                 n.set_body(body)
+                for label, action, target in buttons:
+                    if target is None:
+                        n.add_button(label, action)
+                    else:
+                        n.add_button_with_target_value(label, action, target)
                 app.send_notification(None, n)
                 return
         except (GLib.Error, TypeError):
@@ -1253,11 +1337,10 @@ class TaskManager:
         self.search.connect("search-changed", self.on_search)
         bar.pack_start(self.search, True, True, 0)
 
-        self.btn_dotnet = Gtk.ToggleButton(label="Sadece dotnet")
-        self.btn_dotnet.set_tooltip_text("dotnet / MSBuild / VBCSCompiler / testhost süreçlerini göster")
-        self.btn_dotnet.set_active(self.dotnet_only)
-        self.btn_dotnet.connect("toggled", self.on_dotnet_toggle)
-        bar.pack_start(self.btn_dotnet, False, False, 0)
+        self.btn_dev = Gtk.ToggleButton(label="Sadece geliştirme")
+        self.btn_dev.set_active(self.dev_only)
+        self.btn_dev.connect("toggled", self.on_dev_toggle)
+        bar.pack_start(self.btn_dev, False, False, 0)
 
         self.btn_tree = Gtk.ToggleButton(label="Ağaç görünümü")
         self.btn_tree.set_tooltip_text("Süreçleri ebeveyn-çocuk ilişkisiyle göster (dotnet run → uygulama → MSBuild)")
@@ -1290,10 +1373,9 @@ class TaskManager:
         btn_end.connect("clicked", lambda _b: self.end_tasks(signal.SIGTERM))
         bar.pack_end(btn_end, False, False, 0)
 
-        btn_clean = Gtk.Button(label="MSBuild artıklarını temizle")
-        btn_clean.set_tooltip_text("Boşta bekleyen MSBuild node'larını ve VBCSCompiler'ı kapatır")
-        btn_clean.connect("clicked", lambda _b: self.cleanup_dotnet())
-        bar.pack_end(btn_clean, False, False, 0)
+        self.btn_idle = Gtk.Button(label="Boşta artıkları temizle")
+        self.btn_idle.connect("clicked", lambda _b: self.cleanup_idle())
+        bar.pack_end(self.btn_idle, False, False, 0)
         page.pack_start(bar, False, False, 0)
 
         self.store = Gtk.TreeStore(*COL_TYPES)
@@ -1401,7 +1483,7 @@ class TaskManager:
 
     # ---- filtre
     def self_matches(self, model, it):
-        if self.dotnet_only and not model.get_value(it, COL_DOTNET):
+        if self.dev_only and not model.get_value(it, COL_DEV):
             return False
         if self.port_query is not None:
             return f" {self.port_query} " in model.get_value(it, COL_PORTNUMS)
@@ -1453,8 +1535,8 @@ class TaskManager:
             self.flash(explain_port(self.port_query), 12)
         return False
 
-    def on_dotnet_toggle(self, btn):
-        self.dotnet_only = btn.get_active()
+    def on_dev_toggle(self, btn):
+        self.dev_only = btn.get_active()
         self.filter.refilter()
         self.update_status()
 
@@ -1741,6 +1823,11 @@ class TaskManager:
         listing = "\n".join(f"{pid}  {name}" for pid, name, _c, _w in sel[:10])
         if len(sel) > 10:
             listing += f"\n… ve {len(sel) - 10} süreç daha"
+        pats = self.protect_patterns()
+        guarded = [f"{pid}  {name}" for pid, name, cmd, _w in sel
+                   if tm_alerts.is_protected(pats, name, cmd, self.proc_project.get(pid) or "")]
+        if guarded:
+            listing += ("\n\n⚠ Korunanlar listesindeki süreçler de seçili:\n" + "\n".join(guarded[:5]))
         what = "ağacıyla birlikte " if tree else ""
         title = f"{len(sel)} süreç {what}{signal.Signals(sig).name} ile sonlandırılsın mı?"
         if not self.confirm(title, listing, "Sonlandır"):
@@ -1760,28 +1847,32 @@ class TaskManager:
         return False
 
     def cleanup_targets(self):
-        nodes, compilers = [], []
+        """Boşta (CPU < %2), kendi kullanıcının, korunmayan ve secili profillerin 'bosta kapatilabilir' kurallarina
+        uyan surecler -> [satir + 'idle' etiketi]"""
+        out = []
         for r in self.last_procs:
             if r["uid"] != ME or r["cpu_raw"] >= 2.0:
                 continue
-            if MSBUILD_NODE_RX.search(r["cmd"]):
-                nodes.append(r)
-            elif "VBCSCompiler" in r["cmd"]:
-                compilers.append(r)
-        return nodes, compilers
+            label = ACTIVE.idle_label(r["cmd"])
+            if label and not self.is_protected(r):
+                out.append(dict(r, idle=label))
+        return out
 
-    def cleanup_dotnet(self):
-        nodes, compilers = self.cleanup_targets()
-        if not nodes and not compilers:
-            self.flash("Temizlenecek boşta MSBuild node'u ya da VBCSCompiler yok.")
+    def cleanup_idle(self):
+        rows = self.cleanup_targets()
+        if not rows:
+            self.flash("Temizlenecek boşta artık süreç yok." if ACTIVE.idle_rules
+                       else "Seçili profillerde boşta kapatılacak süreç türü tanımlı değil.")
             return
-        total = sum(r["rss"] for r in nodes + compilers)
-        detail = (f"{len(nodes)} MSBuild node'u ve {len(compilers)} VBCSCompiler kapatılacak "
-                  f"(toplam {fmt_bytes(total)} RAM).\n\n"
-                  "CPU kullanan süreçler atlanır. Bir derleme sürüyorsa bitmesini bekle. "
+        kinds = {}
+        for r in rows:
+            kinds[r["idle"]] = kinds.get(r["idle"], 0) + 1
+        what = ", ".join(f"{n} {k}" for k, n in kinds.items())
+        detail = (f"{what} kapatılacak (toplam {fmt_bytes(sum(r['rss'] for r in rows))} RAM).\n\n"
+                  "CPU kullanan ve korunan süreçler atlanır. Bir derleme sürüyorsa bitmesini bekle. "
                   "Sonraki build'de bu süreçler yeniden başlar.")
-        if self.confirm("Boşta bekleyen MSBuild artıkları temizlensin mi?", detail, "Temizle"):
-            self.send_signal([r["pid"] for r in nodes + compilers], signal.SIGTERM, False)
+        if self.confirm("Boşta bekleyen artıklar temizlensin mi?", detail, "Temizle"):
+            self.send_signal([r["pid"] for r in rows], signal.SIGTERM, False)
 
     def on_key(self, _win, ev):
         focus = self.win.get_focus() if self.win else None
@@ -1835,7 +1926,7 @@ class TaskManager:
         shown, nums = ports_info(ports)
         search = f"{r['raw_name']} {r['name']} {r['cmd']} {r['cwd']} {r['pid']}{nums}".lower()
         return [r["pid"], r["name"], r["cpu"], r["rss"], r["threads"], r["user"], r["started"], r["cmd"],
-                r["cwd"], r["status"], r["ppid"], r["dotnet"], search, shown, nums, r.get("pss", 0), r["nice"],
+                r["cwd"], r["status"], r["ppid"], r["dev"], search, shown, nums, r.get("pss", 0), r["nice"],
                 r.get("io_r", -1), r.get("io_w", -1)]
 
     def store_subtree(self, it, acc):
@@ -1919,7 +2010,7 @@ class TaskManager:
 
         if self.tree_mode:
             self.collapsed &= set(live)
-            if self.query or self.dotnet_only or self.port_query is not None or self.proj_filter is not None:
+            if self.query or self.dev_only or self.port_query is not None or self.proj_filter is not None:
                 self.filter.refilter()  # alt surec degisince ata gorunurlugu de degisebilir
             for pid in sorted(expand, key=lambda p: len(self.store.get_path(self.iters[p]).get_indices())):
                 if pid not in self.collapsed:
@@ -1948,13 +2039,15 @@ class TaskManager:
             self.status.set_markup(f"<b>{GLib.markup_escape_text(self.flash_text)}</b>")
             return
         shown = self.count_rows(self.sort)
-        dn = [r for r in self.last_procs if r["dotnet"]]
-        nodes = [r for r in self.last_procs if MSBUILD_NODE_RX.search(r["cmd"])]
-        node_txt = f"MSBuild node: {len(nodes)} ({fmt_bytes(sum(r['rss'] for r in nodes))})"
-        if len(nodes) > 8:
-            node_txt = f"<span foreground='#e8890c'><b>{node_txt}</b></span>"
+        dev = [r for r in self.last_procs if r["dev"]]
+        idle = self.cleanup_targets()
         text = (f"Listelenen: {shown}/{len(self.last_procs)}   │   "
-                f"dotnet: {len(dn)} süreç ({fmt_bytes(sum(r['rss'] for r in dn))})   │   {node_txt}")
+                f"{self.profile_summary()}: {len(dev)} süreç ({fmt_bytes(sum(r['rss'] for r in dev))})")
+        if ACTIVE.idle_rules:
+            idle_txt = f"boşta artık: {len(idle)} ({fmt_bytes(sum(r['rss'] for r in idle))})"
+            if len(idle) > 8:
+                idle_txt = f"<span foreground='#e8890c'><b>{idle_txt}</b></span>"
+            text += f"   │   {idle_txt}"
         if self.stuck:
             text += (f"   │   <span foreground='#e8890c'><b>⚠ {len(self.stuck)} süreç disk beklemesinde takılı</b>"
                      f"</span> (aramaya 'takılı' yaz)")
@@ -1985,7 +2078,9 @@ class TaskManager:
 
         self.g_mem = Graph([purple])
         self.s_mem = StatBlock([("use", "Kullanımda"), ("avail", "Kullanılabilir"), ("cache", "Önbellek"),
-                                ("total", "Toplam"), ("swap", "Swap"), ("pct", "Kullanım oranı")])
+                                ("total", "Toplam"), ("swap", "Swap (kullanılan / toplam)"),
+                                ("swapio", "Swap trafiği (içeri / dışarı)"), ("zram", "zram (sıkıştırılmış RAM swap)"),
+                                ("pct", "Kullanım oranı")])
         self.stack.add_titled(make_page("Bellek", f"<span alpha='65%'>{fmt_bytes(psutil.virtual_memory().total)} RAM</span>",
                                         self.g_mem, self.s_mem), "mem", "Bellek")
 
@@ -2048,6 +2143,11 @@ class TaskManager:
                                            ("En yüksek CPU", 100, True), ("En yüksek RAM", 100, True),
                                            ("Ort. disk G/Y", 110, True), ("Görülme", 75, True)])
         nb.append_page(sc, Gtk.Label(label="En çok yiyenler"))
+        self.hist_projs, sc = simple_table([("Proje", 200, False), ("Ort. CPU", 80, True),
+                                            ("En yüksek CPU", 100, True), ("En yüksek RAM", 110, True),
+                                            ("Ort. disk G/Y", 110, True), ("Takılmada suçlu", 110, True),
+                                            ("Görülme", 75, True)])
+        nb.append_page(sc, Gtk.Label(label="Projeler"))
         self.hist_events, sc = simple_table([("Zaman", 130, False), ("Tür", 80, False), ("Olay", 400, False)])
         nb.append_page(sc, Gtk.Label(label="Olaylar"))
         paned.pack2(nb, True, False)
@@ -2077,6 +2177,7 @@ class TaskManager:
                 bucket, rows = h.series(since, until)
                 res = dict(since=since, until=until, bucket=bucket, rows=rows, thr=thr, n=span[2] if span else 0,
                            stall_rows=h.stalls(since, until, thr), offs=h.offenders(since, until),
+                           projs=h.by_project(since, until, thr),
                            events=h.events(since, until))
             except sqlite3.Error as e:
                 res = dict(error=str(e))
@@ -2107,6 +2208,11 @@ class TaskManager:
             self.hist_offs.append([o["name"], o["project"] or "–", f"%{o['avg_cpu']:.1f}", f"%{o['max_cpu']:.0f}",
                                    fmt_bytes(o["max_mem"]), fmt_rate(o["io_r"] + o["io_w"]),
                                    f"%{o['seen'] * 100 / max(1, o['total']):.0f}"])
+        self.hist_projs.clear()
+        for o in res["projs"]:
+            self.hist_projs.append([o["project"] or "(proje dışı)", f"%{o['avg_cpu']:.1f}", f"%{o['max_cpu']:.0f}",
+                                    fmt_bytes(o["max_mem"]), fmt_rate(o["io"]), str(o["stalls"]),
+                                    f"%{o['seen'] * 100 / max(1, o['total']):.0f}"])
         self.hist_events.clear()
         for ts, kind, text in res["events"]:
             self.hist_events.append([fmt_ts(ts), kind, text])
@@ -2473,7 +2579,7 @@ class TaskManager:
             dict(key="count", title="Süreç", col=P_COUNT, sort=P_COUNT, width=80, xalign=1.0),
             dict(key="cpu", title="CPU", col=P_CPU, sort=P_CPU, width=80, xalign=1.0, func=self.proj_cpu_cell),
             dict(key="mem", title="Bellek (PSS)", col=P_MEM, sort=P_MEM, width=110, xalign=1.0, func=self.proj_mem_cell),
-            dict(key="dotnet", title="dotnet süreç", col=P_DOTNET, sort=P_DOTNET, width=125, xalign=1.0),
+            dict(key="dev", title="Geliştirme süreci", col=P_DEV, sort=P_DEV, width=125, xalign=1.0),
             dict(key="branch", title="Git dalı", col=P_BRANCH, sort=P_BRANCH, width=150),
             dict(key="dirty", title="Git durumu", col=P_DIRTY, sort=P_DIRTY, width=130, func=self.proj_dirty_cell),
             dict(key="path", title="Yol", col=P_PATH, sort=P_PATH, width=400, expand=True),
@@ -2544,7 +2650,7 @@ class TaskManager:
             s[0] += 1
             s[1] += r["cpu"]
             s[2] += r["pss"] or r["rss"]
-            s[3] += r["dotnet"]
+            s[3] += r["dev"]
         for root, (n, cpu, rss, dn) in stats.items():
             it = self.proj_iters.get(root)
             if it is None:
@@ -2553,7 +2659,7 @@ class TaskManager:
                 self.proj_iters[root] = self.pstore.append([root, name, shorten_home(root), n, cpu, rss, dn,
                                                             branch, dirty])
             else:
-                self.pstore.set(it, [P_COUNT, P_CPU, P_MEM, P_DOTNET], [n, cpu, rss, dn])
+                self.pstore.set(it, [P_COUNT, P_CPU, P_MEM, P_DEV], [n, cpu, rss, dn])
         for root in [x for x in self.proj_iters if x not in stats]:
             self.pstore.remove(self.proj_iters.pop(root))
         projects = [v for k, v in stats.items() if k]
@@ -3028,6 +3134,12 @@ class TaskManager:
             box.pack_start(row, False, False, 0)
             widgets[key] = sp
 
+        section("Profil")
+        note("Hangi teknolojilerle çalışıyorsan işaretle (birden fazla seçilebilir). Profil; hangi süreçlerin "
+             "'geliştirme süreci' sayıldığını, boşta bırakılınca kapatılabilecek artıkları ve Temizlik sekmesinde "
+             "taranacak klasörleri belirler.")
+        self.build_profile_checks(box, widgets)
+
         section("Geçmiş")
         check("Geçmişi diske kaydet", "log_enabled",
               "Sistem yükü ~10 sn'de, en çok kaynak kullanan süreçler dakikada bir (takılma anında 10 sn'de bir) yazılır")
@@ -3061,17 +3173,36 @@ class TaskManager:
         section("Bildirimler")
         check("RAM dolmaya yaklaşınca masaüstü bildirimi gönder", "notify_mem")
         spin_row("RAM doluluk eşiği", "notify_mem_pct", "%")
+        check("Sistem takılınca suçluyu bildir (tek tıkla sonlandırma düğmesiyle)", "notify_stall",
+              "Baskı (PSI) 'Takılma eşiği'nin üstünde birkaç saniye kalırsa; en çok kaynak yiyen kendi sürecin bildirilir. "
+              "Korunanlar ve sistem süreçleri hiç önerilmez. En sık 5 dakikada bir.")
+        check("Disk dolmaya yaklaşınca bildirim gönder", "notify_disk",
+              "Kök disk ve ev dizininin diski için; dakikada bir kontrol, aynı disk için 6 saatte bir bildirim")
+        spin_row("Disk doluluk eşiği", "notify_disk_pct", "%")
+
+        section("Korunan süreçler")
+        note("Her satıra bir ad, komut parçası ya da proje adı yaz (büyük/küçük harf fark etmez). Eşleşen süreçler "
+             "otomatik temizlikte kapatılmaz, takılma bildiriminde önerilmez; elle sonlandırırken uyarı çıkar. "
+             "Örnek: LosevApi")
+        tv = Gtk.TextView()
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.set_size_request(-1, 90)
+        tv.get_buffer().set_text("\n".join(self.protect_patterns()))
+        tv.get_buffer().connect("changed", self.on_protect_changed)
+        frame = Gtk.Frame()
+        frame.add(tv)
+        box.pack_start(frame, False, False, 0)
+        widgets["protect"] = tv
 
         section("Otomatik temizlik")
-        check("Boşta kalan MSBuild node / VBCSCompiler'ı otomatik kapat", "auto_idle",
-              "Yalnızca RAM aşağıdaki eşiğin üstündeyken ve süreç belirtilen süre boyunca boştayken (CPU < %2)")
+        check("Boşta kalan artık süreçleri otomatik kapat (profile göre)", "auto_idle",
+              "MSBuild node, VBCSCompiler, Gradle daemon vb. Yalnızca RAM aşağıdaki eşiğin üstündeyken ve süreç "
+              "belirtilen süre boyunca boştayken (CPU < %2)")
         spin_row("Şu kadar dakika boşta kalırsa", "auto_idle_min", "dk")
         spin_row("RAM doluluğu en az", "auto_idle_mem", "%  (0 = her zaman)")
-        b_srv = Gtk.Button(label="dotnet build-server shutdown")
-        b_srv.set_halign(Gtk.Align.START)
-        b_srv.set_tooltip_text("Tüm dotnet derleme sunucularını (MSBuild, VBCSCompiler, Razor) kapatır")
-        b_srv.connect("clicked", lambda _b: self.build_server_shutdown())
-        box.pack_start(b_srv, False, False, 0)
+        self.shutdown_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.pack_start(self.shutdown_box, False, False, 0)
+        self.fill_shutdown_box()
 
         section("Yetkili okuma")
         box.pack_start(self.make_priv_toggle("Yetkili okuma (root, salt okunur)"), False, False, 0)
@@ -3088,7 +3219,38 @@ class TaskManager:
         dlg.show_all()
         self.update_history_info()
 
+    def build_profile_checks(self, box, widgets):
+        def toggled(_chk):
+            ids = [pid for pid, c in widgets["profiles"].items() if c.get_active()]
+            self.apply_profiles(ids)
+
+        widgets["profiles"] = {}
+        for pid, prof in self.profiles.items():
+            chk = Gtk.CheckButton(label=prof["name"] + ("  (özel)" if prof.get("custom") else ""))
+            chk.set_tooltip_text(prof["desc"])
+            chk.set_active(pid in ACTIVE.ids)
+            chk.connect("toggled", toggled)
+            box.pack_start(chk, False, False, 0)
+            widgets["profiles"][pid] = chk
+            lbl = Gtk.Label(label=prof["desc"], xalign=0)
+            lbl.get_style_context().add_class("dim-label")
+            lbl.set_margin_start(26)
+            box.pack_start(lbl, False, False, 0)
+
+    def on_protect_changed(self, buf):
+        if getattr(self, "_protect_timer", None):
+            GLib.source_remove(self._protect_timer)
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        self._protect_timer = GLib.timeout_add(600, self.save_protect, text)
+
+    def save_protect(self, text):
+        self._protect_timer = None
+        self.settings["protect"] = tm_alerts.parse_patterns(text)
+        self.save_settings(self.win)
+        return False
+
     def on_settings_closed(self, _dlg):
+        self.shutdown_box = None
         self.settings_win = None
         self.hist_info_label = None
 
@@ -3472,7 +3634,9 @@ class TaskManager:
             self.s_mem.set("avail", fmt_bytes(vm.available))
             self.s_mem.set("cache", fmt_bytes(getattr(vm, "cached", 0) + getattr(vm, "buffers", 0)))
             self.s_mem.set("total", fmt_bytes(vm.total))
-            self.s_mem.set("swap", f"{fmt_bytes(sw.used)} / {fmt_bytes(sw.total)}")
+            self.s_mem.set("swap", f"{fmt_bytes(sw.used)} / {fmt_bytes(sw.total)}" if sw.total else "yok")
+            self.s_mem.set("swapio", self.swap_traffic(sw))
+            self.s_mem.set("zram", self.zram_text())
             self.s_mem.set("pct", f"{vm.percent:.0f}%")
             self.s_disk.set("r", fmt_bytes(rd) + "/s")
             self.s_disk.set("w", fmt_bytes(wr) + "/s")
@@ -3512,6 +3676,24 @@ class TaskManager:
                              refreshed)
         return True
 
+    def swap_traffic(self, sw):
+        """Swap'e giren/cikan veri hizi - cikis surekli yuksekse RAM yetmiyor demektir."""
+        now = time.monotonic()
+        last, self.last_swap = self.last_swap, (sw.sin, sw.sout, now)
+        if last is None or now <= last[2]:
+            return "–"
+        dt = now - last[2]
+        return f"{fmt_rate(max(0, sw.sin - last[0]) / dt)}  /  {fmt_rate(max(0, sw.sout - last[1]) / dt)}"
+
+    def zram_text(self):
+        z = tm_alerts.zram_stats()
+        if z is None:
+            return "yok"
+        orig, compr, _used = z
+        if not orig:
+            return "kullanılmıyor"
+        return f"{fmt_bytes(orig)} → {fmt_bytes(compr)}  ({orig / max(1, compr):.1f}×)"
+
     def update_psi_top(self):
         cpu = self.top_by(lambda p: p["cpu"], lambda v: f"%{v:.0f}")
         mem = self.top_by(lambda p: p["pss"] or p["rss"], fmt_bytes)
@@ -3536,24 +3718,98 @@ class TaskManager:
             self.log_event("bellek", msg)
         if refreshed:
             self.auto_idle_step(vm.percent)
+        self.stall_step(now, sysrow[3], sysrow[4], sysrow[5])
+        self.disk_step(now)
         if self.history is not None and time.monotonic() - self.last_prune > 3600:
             self.last_prune = time.monotonic()
             self.prune_history()
 
+    def stall_step(self, now, pc, pm, pio):
+        """Baski (PSI) esigin ustunde STALL_TICKS sn kalirsa suclu sureci ve 'Sonlandir' dugmesiyle bildir. -> bildirildi mi"""
+        if max(pc, pm, pio) < self.pref("stall_psi"):
+            self.stall_ticks = 0
+            return False
+        self.stall_ticks += 1
+        if (self.stall_ticks < STALL_TICKS or not self.pref("notify_stall")
+                or now - self.stall_note_t < STALL_NOTE_COOLDOWN):
+            return False
+        self.stall_note_t = now
+        peaks = {"cpu": pc, "mem": pm, "io": pio}
+        cause = max(peaks, key=peaks.get)
+        hit = tm_alerts.pick_culprit(self.last_procs, cause, ME, self.protect_patterns(), self.proc_project)
+        title = f"Sistem takılıyor ({CAUSE_TR[cause]} baskısı %{peaks[cause]:.0f})"
+        buttons = []
+        if hit is None:
+            body = "Belirgin tek bir suçlu bulunamadı (ya da suçlu korunan/sistem sürecidir). Ayrıntı: Performans → Baskı."
+        else:
+            p, v = hit
+            proj = os.path.basename(self.proc_project.get(p["pid"]) or "")
+            shown = {"cpu": f"CPU %{p['cpu']:.0f}", "mem": f"bellek {fmt_bytes(v)}", "io": f"disk {fmt_rate(v)}"}[cause]
+            body = f"En çok kullanan: {p['name']}" + (f" ({proj})" if proj else "") + f" – {shown}"
+            try:
+                ct = psutil.Process(p["pid"]).create_time()
+                buttons.append((f"{p['name']} sonlandır", "app.kill-stall",
+                                GLib.Variant("s", f"{p['pid']}:{ct}")))
+            except psutil.Error:
+                pass
+        self.notify(title, body, buttons)
+        self.log_event("takılma", f"{title}. {body}")
+        return True
+
+    def kill_stalled(self, target):
+        """Bildirimdeki 'sonlandir' dugmesi: ayni surec (PID + baslangic zamani) hala calisiyorsa SIGTERM."""
+        try:
+            pid_s, ct_s = target.split(":")
+            pid, ct = int(pid_s), float(ct_s)
+            p = psutil.Process(pid)
+            if abs(p.create_time() - ct) > 0.5 or p.uids().real != ME:
+                raise psutil.NoSuchProcess(pid)
+            name, cmd = p.name(), " ".join(p.cmdline())
+        except (ValueError, psutil.Error):
+            self.notify("Süreç bulunamadı", "Süreç zaten kapanmış ya da başka bir süreç olmuş; hiçbir şey yapılmadı.")
+            return False
+        if tm_alerts.is_essential(name, cmd) or tm_alerts.is_protected(
+                self.protect_patterns(), name, cmd, self.proc_project.get(pid) or ""):
+            self.notify("Sonlandırılmadı", f"{name} korunan ya da sistem sürecidir.")
+            return False
+        ok, errs = kill_pids([pid], signal.SIGTERM, False)
+        msg = f"{name} (PID {pid}) sonlandırıldı." if ok else f"{name} sonlandırılamadı: {'; '.join(errs[:1])}"
+        self.flash(msg, 10)
+        self.notify("Süreç sonlandırıldı" if ok else "Sonlandırılamadı", msg)
+        self.log_event("takılma", msg)
+        return bool(ok)
+
+    def disk_step(self, now):
+        """Disk doluluğu eşiği aşarsa (dakikada bir kontrol, yol başına 6 saatte bir) 'Temizlik'i aç' düğmeli bildirim."""
+        if not self.pref("notify_disk") or now - self.disk_check_t < DISK_CHECK_EVERY:
+            return []
+        self.disk_check_t = now
+        sent = []
+        for path, pct, free in tm_alerts.full_disks(self.pref("notify_disk_pct")):
+            if now - self.disk_note_t.get(path, -DISK_NOTE_COOLDOWN) < DISK_NOTE_COOLDOWN:
+                continue
+            self.disk_note_t[path] = now
+            msg = f"{path} %{pct:.0f} dolu, {fmt_bytes(free)} boş. Yeniden üretilebilir klasörleri Temizlik sekmesinden silebilirsin."
+            self.notify("Disk dolmak üzere", msg, [("Temizlik'i aç", "app.open-tab", GLib.Variant("i", TAB_CLEAN))])
+            self.log_event("disk", msg)
+            sent.append(path)
+        return sent
+
     def auto_idle_step(self, mem_pct):
-        """Bosta (CPU < %2) MSBuild node / VBCSCompiler'lari, RAM yuksekse ve yeterince uzun sure bosta kaldiysa kapat."""
-        nodes, comps = self.cleanup_targets()
+        """Bosta (CPU < %2) artik surecleri (profile gore: MSBuild node, Gradle daemon...), RAM yuksekse ve yeterince uzun
+        sure bosta kaldiysa kapat."""
+        rows = self.cleanup_targets()
         now = time.monotonic()
-        idle = {r["pid"]: self.idle_since.get(r["pid"], now) for r in nodes + comps}
+        idle = {r["pid"]: self.idle_since.get(r["pid"], now) for r in rows}
         self.idle_since = idle
         if not self.pref("auto_idle") or mem_pct < self.pref("auto_idle_mem"):
             return
         limit = self.pref("auto_idle_min") * 60
-        old = [r for r in nodes + comps if now - idle[r["pid"]] >= limit]
+        old = [r for r in rows if now - idle[r["pid"]] >= limit]
         if not old:
             return
         kill_pids([r["pid"] for r in old], signal.SIGTERM, False)
-        msg = (f"Otomatik temizlik: boşta bekleyen {len(old)} MSBuild/VBCSCompiler kapatıldı "
+        msg = (f"Otomatik temizlik: boşta bekleyen {len(old)} süreç ({', '.join(sorted({r['idle'] for r in old}))}) kapatıldı "
                f"({fmt_bytes(sum(r['rss'] for r in old))}), RAM %{mem_pct:.0f}.")
         self.flash(msg, 10)
         self.notify("Otomatik temizlik", msg)
@@ -3580,21 +3836,39 @@ class TaskManager:
             done(n)
         return False
 
-    def build_server_shutdown(self):
-        self.flash("dotnet build-server shutdown çalışıyor…")
+    def build_server_shutdown(self, name, cmd):
+        self.flash(f"{name}: {' '.join(cmd)} çalışıyor…")
 
         def work():
             try:
-                res = subprocess.run(["dotnet", "build-server", "shutdown"], capture_output=True, text=True,
-                                     timeout=60)
-                msg = ("dotnet derleme sunucuları kapatıldı." if res.returncode == 0
-                       else "dotnet hata verdi: " + (res.stderr.strip().splitlines() or ["?"])[-1])
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                msg = (f"{name} derleme sunucuları kapatıldı." if res.returncode == 0
+                       else f"{cmd[0]} hata verdi: " + (res.stderr.strip().splitlines() or ["?"])[-1])
             except FileNotFoundError:
-                msg = "dotnet bulunamadı."
+                msg = f"{cmd[0]} bulunamadı."
             except subprocess.TimeoutExpired:
-                msg = "dotnet build-server shutdown zaman aşımına uğradı."
+                msg = f"{' '.join(cmd)} zaman aşımına uğradı."
             GLib.idle_add(self.flash_idle, msg)
         threading.Thread(target=work, daemon=True).start()
+
+    def fill_shutdown_box(self):
+        """Ayarlar'daki 'derleme sunucusunu kapat' düğmeleri: secili profillere gore."""
+        box = self.shutdown_box
+        if box is None:
+            return
+        for child in box.get_children():
+            box.remove(child)
+        for name, cmd in ACTIVE.shutdowns:
+            b = Gtk.Button(label=" ".join(cmd))
+            b.set_halign(Gtk.Align.START)
+            b.set_tooltip_text(f"{name}: arka planda kalan derleme sunucularını kapatır")
+            b.connect("clicked", lambda _b, n=name, c=cmd: self.build_server_shutdown(n, c))
+            box.pack_start(b, False, False, 0)
+        if not ACTIVE.shutdowns:
+            lbl = Gtk.Label(label="Seçili profillerde kapatılacak bir derleme sunucusu komutu yok.", xalign=0)
+            lbl.get_style_context().add_class("dim-label")
+            box.pack_start(lbl, False, False, 0)
+        box.show_all()
 
     def flash_idle(self, msg):
         self.flash(msg, 10)
@@ -3682,6 +3956,36 @@ class TaskManager:
         self.stats.wake.set()
         if not hidden:
             self.refresh_processes()
+            if self.first_run_profiles and self.win is not None:
+                GLib.idle_add(self.show_profile_chooser)
+
+    def show_profile_chooser(self):
+        """Ilk acilista: hangi teknolojilerle calisildigini sor (sonradan Ayarlar -> Profil'den degisir)."""
+        if not self.first_run_profiles:
+            return False
+        self.first_run_profiles = False
+        dlg = Gtk.Dialog(title="Hoş geldin – profilini seç", transient_for=self.toplevel(), modal=True)
+        dlg.add_button("Tamam", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(16)
+        lbl = Gtk.Label(label="Hangi teknolojilerle çalışıyorsun? Seçimine göre 'geliştirme süreçleri', boşta "
+                              "temizlenecek artıklar ve temizlenecek klasörler (bin/obj, node_modules…) belirlenir. "
+                              "İstediğin zaman Ayarlar → Profil'den değiştirebilirsin.",
+                        xalign=0, wrap=True)
+        lbl.set_max_width_chars(60)
+        box.pack_start(lbl, False, False, 0)
+        widgets = {}
+        self.build_profile_checks(box, widgets)
+        dlg.test_parts = widgets
+        dlg.show_all()
+        self.chooser = dlg
+        dlg.run()
+        dlg.destroy()
+        self.chooser = None
+        self.save_settings(self.win)
+        return False
 
     def quit_app(self):
         self.quitting = True
@@ -3719,7 +4023,8 @@ class TaskManager:
             "tab": self.root.get_current_page(),
             "perf_page": self.stack.get_visible_child_name(),
             "tree_mode": self.tree_mode,
-            "dotnet_only": self.dotnet_only,
+            "dev_only": self.dev_only,
+            "profiles": list(ACTIVE.ids),
             "all_users": self.show_all_users,
             "docker_all": self.docker_all,
             "proc_columns": self.pcols.to_dict(),
@@ -3737,6 +4042,7 @@ class TaskManager:
             "clean_roots": self.clean_roots,
             "hist_range": self.hist_range.get_active(),
             "bg_hint": bool(self.settings.get("bg_hint")),
+            "protect": self.protect_patterns(),
         }
         for key in PREFS:
             data[key] = self.pref(key)
@@ -3752,6 +4058,23 @@ class App(Gtk.Application):
         super().__init__(application_id=app_id)
         self.tm = None
         self.background = background
+        kill = Gio.SimpleAction.new("kill-stall", GLib.VariantType.new("s"))
+        kill.connect("activate", lambda _a, v: self.tm and self.tm.kill_stalled(v.get_string()))
+        self.add_action(kill)
+        open_tab = Gio.SimpleAction.new("open-tab", GLib.VariantType.new("i"))
+        open_tab.connect("activate", self.on_open_tab)
+        self.add_action(open_tab)
+
+    def on_open_tab(self, _action, value):
+        if self.tm is None:
+            return
+        self.tm.set_hidden(False)
+        wins = self.get_windows()
+        if wins:
+            wins[0].present()
+        page = value.get_int32()
+        if 0 <= page <= TAB_SERVICES:
+            self.tm.root.set_current_page(page)
 
     def do_activate(self):
         wins = self.get_windows()
@@ -3780,6 +4103,8 @@ class App(Gtk.Application):
         else:
             win.show()
             win.present()
+            if tm.first_run_profiles:
+                GLib.idle_add(tm.show_profile_chooser)
 
     def on_delete(self, win, _ev):
         tm = self.tm
@@ -3852,10 +4177,10 @@ def selfshot(outdir, steps=None):
             tm.root.set_current_page(TAB_PROCESSES)
             tm.search.set_text("")
             tm.btn_tree.set_active(True)
-            tm.btn_dotnet.set_active(True)
+            tm.btn_dev.set_active(True)
         elif name == "docker":
             tm.btn_tree.set_active(False)
-            tm.btn_dotnet.set_active(False)
+            tm.btn_dev.set_active(False)
             tm.root.set_current_page(TAB_DOCKER)
             spin(3.5)
         elif name == "portstab":
@@ -3891,7 +4216,9 @@ def selfshot(outdir, steps=None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == "--selfshot":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
+        print(f"tskmngr {VERSION}")
+    elif len(sys.argv) > 2 and sys.argv[1] == "--selfshot":
         selfshot(sys.argv[2])
     elif len(sys.argv) > 2 and sys.argv[1] == "--screenshots":
         screenshots(sys.argv[2])

@@ -186,6 +186,28 @@ class History:
                      max_cpu=mc or 0, max_mem=mm or 0, io_r=ir or 0, io_w=iw or 0)
                 for n, p, c, s, mc, mm, ir, iw in rows]
 
+    def by_project(self, since, until, threshold=None):
+        """Projeye gore toplam -> [dict]. Ayni ornekteki surecler toplanir (bir projenin o andaki toplam CPU / RAM'i).
+        avg_cpu: tum ornekler uzerinden ortalama; threshold verilirse stalls: projenin suclular arasinda
+        gectigi takilma sayisi."""
+        with self.lock:
+            total = self.conn.execute("SELECT COUNT(DISTINCT ts) FROM top WHERE ts BETWEEN ? AND ?",
+                                      (int(since), int(until))).fetchone()[0]
+            rows = self.conn.execute(
+                "SELECT project, COUNT(*), SUM(c), MAX(c), MAX(m), AVG(io), MAX(n) FROM ("
+                "SELECT COALESCE(project, '') AS project, ts, SUM(cpu) AS c, SUM(mem) AS m, "
+                "SUM(io_r + io_w) AS io, COUNT(DISTINCT name) AS n FROM top WHERE ts BETWEEN ? AND ? "
+                "GROUP BY COALESCE(project, ''), ts) GROUP BY project ORDER BY SUM(c) DESC",
+                (int(since), int(until))).fetchall()
+        hits = {}
+        if threshold is not None:
+            for w in self.stalls(since, until, threshold, limit=100000):
+                for project in {c[1] or "" for c in w["culprits"]}:  # takilma basina proje bir kez
+                    hits[project] = hits.get(project, 0) + 1
+        return [dict(project=p, seen=c, total=total, avg_cpu=(s or 0) / max(1, total), max_cpu=mc or 0,
+                     max_mem=mm or 0, io=io or 0, procs=n or 0, stalls=hits.get(p, 0))
+                for p, c, s, mc, mm, io, n in rows]
+
     def stalls(self, since, until, threshold, gap=60, limit=200):
         """Baski (PSI) esigi asilan araliklar, yeniden eskiye -> [dict]"""
         with self.lock:
