@@ -18,7 +18,8 @@ React, Vue, Java, Python ve Rust ekiplerine göre ayarlanır.
   kaynağı beklerken işlerin ne kadar yavaşladığı ve o an en çok kullananlar.
 - **Geçmiş:** sistem yükü ve en çok kaynak kullanan süreçler diske kaydedilir; grafik, "takılma anları" (hangi kaynak
   darboğazdı, suçlular kimdi), "en çok yiyenler", **projeye göre** toplamlar (ortalama / tepe CPU ve RAM, kaç takılmada suçlu çıktı) ve olaylar
-  (otomatik temizlik, bellek / takılma / disk uyarısı) tabloları.
+  (otomatik temizlik, bellek / takılma / disk uyarısı) tabloları. Grafikte fareyle sürükleyip bir zaman aralığı seçersen grafik
+  o aralığa yakınlaşır ve tüm tablolar yalnızca o aralığı gösterir (çift tık / sağ tık / "Seçimi kaldır" ile kalkar).
 - **Docker:** konteyner listesi, istatistikler, başlat / durdur / sil, canlı loglar; bellek limiti sütunu,
   "aynı compose projesini seç" düğmesi.
 - **Projeler:** süreçleri çalışma dizinine göre git deposu / proje bazında gruplar; git dalı ve değişiklik sayısı.

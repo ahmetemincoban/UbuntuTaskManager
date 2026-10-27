@@ -872,17 +872,80 @@ class CoreGrid(SvgCanvas):
 class HistoryGraph(SvgCanvas):
     """Gecmis grafigi: CPU % (mavi), RAM % (mor), en yuksek baski (kirmizi alan), takilma bantlari."""
 
-    def __init__(self):
+    L, R, T, B = 38, 12, 24, 22
+    MIN_SELECT = 5  # px: bundan kisa surukleme tiklama sayilir
+
+    def __init__(self, on_select=None, on_clear=None):
         super().__init__(190)
         self.data = None
+        self.on_select = on_select
+        self.on_clear = on_clear
+        self.drag = None  # (baslangic x, simdiki x) - surukleme suruyorken
+        self.dirty = False
+        # SvgCanvas'in Viewport'u icindeki resmi olay yakalayan bir kutuya sar
+        viewport = self.get_child()
+        viewport.remove(self.img)
+        box = Gtk.EventBox()
+        box.set_visible_window(False)
+        box.add(self.img)
+        viewport.add(box)
+        box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                       Gdk.EventMask.POINTER_MOTION_MASK)
+        box.connect("button-press-event", self.on_press)
+        box.connect("motion-notify-event", self.on_motion)
+        box.connect("button-release-event", self.on_release)
+        box.show_all()
+        self.set_tooltip_text("Fareyle sürükleyerek bir zaman aralığı seç; tablolar yalnızca o aralığı gösterir. "
+                              "Çift tık ya da sağ tık: seçimi kaldır.")
 
     def set_data(self, data):
         self.data = data
+        self.drag = None
         self.refresh()
+
+    def plot_x(self, x):
+        return min(max(x, self.L), self.size[0] - self.R)
+
+    def ts_at(self, x):
+        d = self.data
+        pw = self.size[0] - self.L - self.R
+        return d["since"] + (self.plot_x(x) - self.L) / max(1, pw) * (max(d["until"], d["since"] + 1) - d["since"])
+
+    def on_press(self, _w, ev):
+        if ev.button == 3 or (ev.button == 1 and ev.type == Gdk.EventType._2BUTTON_PRESS):
+            self.drag = None
+            if self.on_clear:
+                self.on_clear()
+            return True
+        if ev.button == 1 and ev.type == Gdk.EventType.BUTTON_PRESS and self.data and self.data.get("rows"):
+            self.drag = (self.plot_x(ev.x), self.plot_x(ev.x))
+        return True
+
+    def on_motion(self, _w, ev):
+        if self.drag:
+            self.drag = (self.drag[0], self.plot_x(ev.x))
+            if not self.dirty:  # SVG'yi her hareket olayinda degil, bosta kalinca bir kez yeniden ciz
+                self.dirty = True
+                GLib.idle_add(self.redraw)
+        return True
+
+    def redraw(self):
+        self.dirty = False
+        return self.refresh()
+
+    def on_release(self, _w, ev):
+        drag, self.drag = self.drag, None
+        if drag and ev.button == 1:
+            a, b = sorted((drag[0], self.plot_x(ev.x)))
+            if b - a >= self.MIN_SELECT and self.on_select:
+                self.on_select(self.ts_at(a), self.ts_at(b))
+                return True
+        self.refresh()
+        return True
 
     def body(self, W, H):
         fg = self.fg()
-        L, R, T, B = 38, 12, 24, 22
+        L, R, T, B = self.L, self.R, self.T, self.B
         pw, ph = W - L - R, H - T - B
         txt = f'fill="{fg}" fill-opacity="0.7" font-size="11"'
         out = []
@@ -904,14 +967,16 @@ class HistoryGraph(SvgCanvas):
         def Y(v):
             return T + ph - min(100.0, max(0.0, v)) / 100 * ph
 
-        fmt = "%H:%M" if span <= 86400 else "%d.%m %H:%M"
+        fmt = "%H:%M:%S" if span <= 900 else "%H:%M" if span <= 86400 else "%d.%m %H:%M"
         for i in range(5):
             ts = since + span * i / 4
             anchor = "start" if i == 0 else "end" if i == 4 else "middle"
             out.append(f'<text x="{X(ts):.1f}" y="{H - 6}" text-anchor="{anchor}" {txt}>'
                        f'{time.strftime(fmt, time.localtime(ts))}</text>')
         for a, b in d.get("stalls", []):
-            x0, x1 = X(a), X(b + SYS_EVERY)
+            x0, x1 = max(float(L), X(a)), min(float(W - R), X(b + SYS_EVERY))  # yakinlastirinca plot disina tasmasin
+            if x1 < x0:
+                continue
             out.append(f'<rect x="{x0:.1f}" y="{T}" width="{max(2.0, x1 - x0):.1f}" height="{ph}" fill="#e5484d" '
                        f'fill-opacity="0.13"/>')
 
@@ -946,6 +1011,13 @@ class HistoryGraph(SvgCanvas):
         out.append(f'<path d="M{L} {ty:.1f}H{W - R}" stroke="#e5484d" stroke-opacity="0.6" stroke-dasharray="4 4" fill="none"/>')
         out.append(f'<rect x="{L + 0.5}" y="{T + 0.5}" width="{pw - 1}" height="{ph - 1}" fill="none" stroke="{fg}" '
                    f'stroke-opacity="0.35"/>')
+        if self.drag and abs(self.drag[1] - self.drag[0]) > 0:
+            a, b = sorted(self.drag)
+            out.append(f'<rect x="{a:.1f}" y="{T}" width="{b - a:.1f}" height="{ph}" fill="#338cd9" fill-opacity="0.18" '
+                       f'stroke="#338cd9" stroke-opacity="0.8"/>')
+            t0, t1 = self.ts_at(a), self.ts_at(b)
+            out.append(f'<text x="{W - R}" y="18" text-anchor="end" {txt}>{time.strftime("%H:%M:%S", time.localtime(t0))}'
+                       f' – {time.strftime("%H:%M:%S", time.localtime(t1))}  ({fmt_duration(t1 - t0)})</text>')
         x = L
         for color, label in (("#338cd9", "CPU %"), ("#9966d9", "RAM %"), ("#e5484d", "En yüksek baskı (PSI)")):
             out.append(f'<rect x="{x}" y="9" width="10" height="10" fill="{color}"/>'
@@ -1170,6 +1242,7 @@ class TaskManager:
         self.prune_busy = False
         self.last_prune = 0.0
         self.hist_token = 0
+        self.hist_sel = None  # (since, until) | None: grafikten secilen aralik
         self.git_cache = {}       # proje koku -> (zaman, dal, degisen dosya sayisi)
         self.git_busy = False
         self.clean_tracked = set()
@@ -2126,13 +2199,17 @@ class TaskManager:
         btn = Gtk.Button(label="Yenile")
         btn.connect("clicked", lambda _b: self.refresh_history())
         bar.pack_start(btn, False, False, 0)
+        self.hist_clear = Gtk.Button(label="Seçimi kaldır")
+        self.hist_clear.set_no_show_all(True)
+        self.hist_clear.connect("clicked", lambda _b: self.clear_hist_select())
+        bar.pack_start(self.hist_clear, False, False, 0)
         self.hist_hint = Gtk.Label(label="", xalign=0, use_markup=True)
         self.hist_hint.set_ellipsize(3)
         bar.pack_start(self.hist_hint, True, True, 0)
         page.pack_start(bar, False, False, 0)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        self.hist_graph = HistoryGraph()
+        self.hist_graph = HistoryGraph(self.on_hist_select, self.clear_hist_select)
         paned.pack1(self.hist_graph, True, False)
         nb = Gtk.Notebook()
         self.hist_stalls, sc = simple_table([("Başlangıç", 130, False), ("Süre", 90, True), ("Neden", 70, False),
@@ -2157,7 +2234,18 @@ class TaskManager:
 
     def on_hist_range(self, combo):
         self.set_pref("hist_range", combo.get_active())
+        self.hist_sel = None  # hazir aralik secilince grafikten yapilan secim gecersiz
         self.refresh_history()
+
+    def on_hist_select(self, t0, t1):
+        """Grafikte surukleyerek secilen aralik: grafik o aralia yakinlasir, tablolar yalniz onu gosterir."""
+        self.hist_sel = (int(t0), max(int(t1), int(t0) + 1))
+        self.refresh_history()
+
+    def clear_hist_select(self):
+        if self.hist_sel is not None:
+            self.hist_sel = None
+            self.refresh_history()
 
     def refresh_history(self):
         """Sorgular arka planda; eski sorgunun cevabi (token) yok sayilir."""
@@ -2168,12 +2256,13 @@ class TaskManager:
         self.hist_token += 1
         token, thr = self.hist_token, self.pref("stall_psi")
         secs = HISTORY_RANGES[max(0, self.hist_range.get_active())][1]
-        until = time.time()
+        sel = self.hist_sel
+        until = sel[1] if sel else time.time()
 
         def work():
             try:
                 span = h.span()
-                since = until - secs if secs else (span[0] if span else until - 3600)
+                since = sel[0] if sel else until - secs if secs else (span[0] if span else until - 3600)
                 bucket, rows = h.series(since, until)
                 res = dict(since=since, until=until, bucket=bucket, rows=rows, thr=thr, n=span[2] if span else 0,
                            stall_rows=h.stalls(since, until, thr), offs=h.offenders(since, until),
@@ -2216,7 +2305,12 @@ class TaskManager:
         self.hist_events.clear()
         for ts, kind, text in res["events"]:
             self.hist_events.append([fmt_ts(ts), kind, text])
-        if not self.pref("log_enabled"):
+        self.hist_clear.set_visible(self.hist_sel is not None)
+        if self.hist_sel:
+            a, b = self.hist_sel
+            hint = (f"<b>Seçili aralık:</b> {fmt_ts(a)} – {time.strftime('%H:%M:%S', time.localtime(b))} "
+                    f"({fmt_duration(b - a)})  │  {len(stalls)} takılma")
+        elif not self.pref("log_enabled"):
             hint = "<span foreground='#e8890c'>Geçmiş kaydı kapalı – Ayarlar'dan aç</span>"
         else:
             hint = (f"{res['n']} kayıt  │  {len(stalls)} takılma (baskı ≥ %{res['thr']})  │  "
