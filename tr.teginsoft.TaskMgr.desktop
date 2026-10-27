@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Görev Yöneticisi
+Comment=Süreçleri, CPU/RAM/Disk/Ağ kullanımını izle ve sonlandır
+Exec=/usr/bin/python3 /path/to/UbuntuTaskManager/taskmgr_gui.py
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+StartupWMClass=tr.teginsoft.TaskMgr
