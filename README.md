@@ -123,7 +123,7 @@ Sistem `python3`, `python3-gi` (GTK 3), `python3-psutil`. Docker sekmesi için `
 
 ```bash
 packaging/build-deb.sh                          # dist/tskmngr_<surum>_all.deb üretir
-sudo apt install ./dist/tskmngr_1.0.0_all.deb   # bağımlılıkları da kurar
+sudo apt install ./dist/tskmngr_1.1.0_all.deb   # bağımlılıkları da kurar
 ```
 
 Kurulunca terminalden `tskmngr` ve uygulama menüsünde "Görev Yöneticisi" gelir; kaldırmak için `sudo apt remove tskmngr`.
