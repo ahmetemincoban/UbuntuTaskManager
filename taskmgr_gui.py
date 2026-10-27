@@ -4,8 +4,10 @@
 Calistirma:  tskmngr   (ya da ./taskmgr_gui.py)
 Gereksinim:  sistem python3 + python3-gi (GTK3) + psutil; Docker sekmesi icin docker CLI
 
-Ayarlar (sutun genisligi/gorunurlugu, siralama, mod, pencere boyutu):
+Ayarlar (sutun genisligi/gorunurlugu, siralama, mod, pencere boyutu, gecmis suresi...):
     ~/.config/tskmngr/settings.json
+Gecmis kaydi (varsayilan 14 gun, Ayarlar'dan degistirilir; eskileri otomatik silinir):
+    ~/.local/share/tskmngr/history.db
 """
 import json
 import math
@@ -15,6 +17,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -26,16 +29,24 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk  # noqa: E402
 
 import psutil  # noqa: E402
+
+# tskmngr bir symlink: kardes modulleri (tm_*.py) gercek dosyanin yanindan al
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import tm_services  # noqa: E402
+from tm_history import DEFAULT_DAYS, SYS_EVERY, History, Recorder, psi_some10, read_psi  # noqa: E402
+from tm_procfs import HelperError, PrivHelper, find_owners, listening_sockets, read_stats  # noqa: E402
 
 APP_ID = "tr.teginsoft.TaskMgr"
 NCPU = psutil.cpu_count() or 1
 ME = os.getuid()
 HOME = os.path.expanduser("~")
 HISTORY = 60  # grafikte saniye
-TAB_PROCESSES, TAB_PERFORMANCE, TAB_DOCKER, TAB_PROJECTS, TAB_PORTS, TAB_CLEAN = range(6)
+(TAB_PROCESSES, TAB_PERFORMANCE, TAB_HISTORY, TAB_DOCKER, TAB_PROJECTS, TAB_PORTS, TAB_CLEAN,
+ TAB_SERVICES) = range(8)
+OLD_TABS = [0, 1, 3, 4, 5, 6]  # ayar dosyasi version 1: sekme sirasi (Gecmis/Servisler yoktu)
 STUCK_SECS = 6  # disk beklemesinde (D) bu kadar saniye kalan surec 'takili' sayilir
 
 DOTNET_RX = re.compile(r"dotnet|MSBuild|VBCSCompiler|testhost|OmniSharp|Microsoft\.CodeAnalysis", re.I)
@@ -49,22 +60,41 @@ STATUS_TR = {"running": "çalışıyor", "sleeping": "uyuyor", "disk-sleep": "di
              "dead": "ölü", "wake-kill": "uyanıyor", "waking": "uyanıyor", "parked": "park"}
 
 (COL_PID, COL_NAME, COL_CPU, COL_RSS, COL_THR, COL_USER, COL_STARTED, COL_CMD,
- COL_CWD, COL_STATUS, COL_PPID, COL_DOTNET, COL_SEARCH, COL_PORTS, COL_PORTNUMS, COL_PSS, COL_NICE) = range(17)
+ COL_CWD, COL_STATUS, COL_PPID, COL_DOTNET, COL_SEARCH, COL_PORTS, COL_PORTNUMS, COL_PSS, COL_NICE,
+ COL_IOR, COL_IOW) = range(19)
 COL_TYPES = [int, str, float, GObject.TYPE_INT64, int, str, float, str, str, str, int, bool, str, str, str,
-             GObject.TYPE_INT64, int]
+             GObject.TYPE_INT64, int, GObject.TYPE_INT64, GObject.TYPE_INT64]
 
 (D_ID, D_NAME, D_PROJECT, D_IMAGE, D_STATE, D_STATUS, D_CPU, D_MEM, D_NET, D_BLOCK, D_PIDS,
- D_PORTS, D_SEARCH) = range(13)
-D_TYPES = [str, str, str, str, str, str, float, GObject.TYPE_INT64, str, str, int, str, str]
+ D_PORTS, D_SEARCH, D_LIMIT) = range(14)
+D_TYPES = [str, str, str, str, str, str, float, GObject.TYPE_INT64, str, str, int, str, str, GObject.TYPE_INT64]
 
-(P_ROOT, P_NAME, P_PATH, P_COUNT, P_CPU, P_MEM, P_DOTNET) = range(7)
-P_TYPES = [str, str, str, int, float, GObject.TYPE_INT64, int]
+(P_ROOT, P_NAME, P_PATH, P_COUNT, P_CPU, P_MEM, P_DOTNET, P_BRANCH, P_DIRTY) = range(9)
+P_TYPES = [str, str, str, int, float, GObject.TYPE_INT64, int, str, int]
 
 (N_KEY, N_PROTO, N_PORT, N_ADDR, N_PID, N_NAME, N_USER, N_PROJECT, N_DOCKER, N_CMD, N_SEARCH) = range(11)
 N_TYPES = [str, str, int, str, int, str, str, str, str, str, str]
 
-(C_PATH, C_PROJECT, C_KIND, C_SIZE, C_SHOWN) = range(5)
-C_TYPES = [str, str, str, GObject.TYPE_INT64, str]
+(C_PATH, C_PROJECT, C_KIND, C_SIZE, C_SHOWN, C_GIT) = range(6)
+C_TYPES = [str, str, str, GObject.TYPE_INT64, str, str]
+
+(S_KEY, S_NAME, S_KIND, S_STATE, S_BOOT, S_MEM, S_DESC, S_SEARCH) = range(8)
+S_TYPES = [str, str, str, str, str, GObject.TYPE_INT64, str, str]
+SERVICE_STATES = {"active": ("çalışıyor", "#3fb950"), "activating": ("başlıyor", "#e8890c"),
+                  "failed": ("başarısız", "#e5484d"), "inactive": ("durdu", None)}
+BOOT_TR = {"enabled": "açık", "disabled": "kapalı", "static": "otomatik", "masked": "maskeli",
+           "generated": "otomatik", "indirect": "dolaylı", "alias": "takma ad"}
+PROTECTED_SERVICES = ("dbus.service", "dbus-broker.service", "gnome-session", "gnome-shell")  # durdurulursa oturum kapanir
+
+# kullanici tercihleri (Ayarlar penceresi). settings.json'da ayni anahtarlarla saklanir
+PREFS = dict(log_enabled=True, log_days=DEFAULT_DAYS, stall_psi=25, bg_run=True, notify_mem=True, notify_mem_pct=90,
+             auto_idle=False, auto_idle_min=10, auto_idle_mem=75)
+PREF_RANGE = dict(log_days=(1, 365), stall_psi=(5, 95), notify_mem_pct=(50, 99), auto_idle_min=(1, 240),
+                  auto_idle_mem=(0, 99))
+MEM_NOTE_COOLDOWN = 600  # sn: bellek uyarisi en sik bu aralikla
+HISTORY_RANGES = [("Son 15 dakika", 900), ("Son 1 saat", 3600), ("Son 6 saat", 6 * 3600),
+                  ("Son 24 saat", 86400), ("Son 7 gün", 7 * 86400), ("Tümü", 0)]
+CAUSE_TR = {"cpu": "CPU", "mem": "Bellek", "io": "Disk"}
 CLEAN_NAMES = {"bin", "obj", "node_modules", "target"}  # sadece bunlar silinebilir
 DEFAULT_CLEAN_ROOTS = [os.path.join(HOME, "Desktop", "GitRepos")]
 
@@ -135,6 +165,25 @@ def parse_size(text):
     if not m:
         return 0
     return int(float(m.group(1)) * _SIZE_UNITS.get(m.group(2).lower(), 1))
+
+
+def fmt_rate(n):
+    return fmt_bytes(n) + "/s"
+
+
+def fmt_ts(ts, date=True):
+    return time.strftime("%d.%m %H:%M:%S" if date else "%H:%M:%S", time.localtime(ts))
+
+
+def fmt_duration(secs):
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs} sn"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m} dk {s:02d} sn"
+    h, m = divmod(m, 60)
+    return f"{h} sa {m:02d} dk"
 
 
 def fmt_elapsed(started, now):
@@ -217,28 +266,6 @@ def collect(show_all):
     return out
 
 
-def listening_sockets():
-    """-> [(pid | None, port, 'tcp'|'udp', ip)]. Root'a ait sureclerin (docker-proxy vb.) pid'i None gelir."""
-    try:
-        conns = psutil.net_connections(kind="inet")
-    except (psutil.AccessDenied, OSError):
-        return []
-    out = []
-    for c in conns:
-        if not c.laddr:
-            continue
-        if c.type == socket.SOCK_STREAM:
-            if c.status != psutil.CONN_LISTEN:
-                continue
-            proto = "tcp"
-        else:
-            if c.laddr.port >= 32768:  # gecici (ephemeral) UDP portlari gurultu
-                continue
-            proto = "udp"
-        out.append((c.pid or None, c.laddr.port, proto, c.laddr.ip))
-    return out
-
-
 def listening_ports(socks):
     """pid -> {(port, 'tcp'|'udp')}"""
     out = {}
@@ -300,84 +327,106 @@ def project_root(cwd):
     return root
 
 
-def find_owners(path):
-    """Bir dosyayi/klasoru acik tutan, calisma dizini yapan ya da bellege haritalayan surecler.
-    -> ([(pid, ad, tur, ornek yol)], okunamayan surec sayisi). Baska kullanicilarin surecleri root ister."""
-    real = os.path.realpath(path)
-    is_dir = os.path.isdir(real)
-    prefix = real.rstrip("/") + "/"
+def git_status(root):
+    """-> (dal metni, degisen dosya sayisi); git deposu degilse ('', -1)"""
+    try:
+        res = subprocess.run(["git", "--no-optional-locks", "-C", root, "status", "--porcelain=v1", "-b"],
+                             capture_output=True, text=True, timeout=15, errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return "", -1
+    if res.returncode != 0:
+        return "", -1
+    lines = res.stdout.splitlines()
+    head = lines[0][3:] if lines and lines[0].startswith("## ") else ""
+    m = re.match(r"(?:No commits yet on |Initial commit on )?(.+?)(?:\.\.\.\S+)?(?: \[(.+)\])?$", head)
+    branch = m.group(1) if m else head
+    if branch.startswith("HEAD (no branch)"):
+        branch = "(ayrık HEAD)"
+    if m and m.group(2):
+        for word, arrow in (("ahead", "↑"), ("behind", "↓")):
+            n = re.search(word + r" (\d+)", m.group(2))
+            if n:
+                branch += f" {arrow}{n.group(1)}"
+    return branch, max(0, len(lines) - 1)
 
-    def hit(t):
-        if t.endswith(" (deleted)"):
-            t = t[:-10]
-        return t == real or (is_dir and t.startswith(prefix))
 
-    me, found, denied = os.getpid(), [], 0
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or int(entry) == me:
-            continue
-        pid, base, kinds = int(entry), f"/proc/{entry}", {}
-        try:
-            fds = os.listdir(base + "/fd")
-        except PermissionError:
-            denied += 1
-            continue
-        except OSError:
-            continue
-        for fd in fds:
+def tracked_dirs(paths):
+    """Icinde git'in izledigi dosya olan klasorler -> set. Emin olunamazsa klasor 'izleniyor' sayilir (silme)."""
+    by_root = {}
+    for p in paths:
+        root = project_root(os.path.dirname(p))
+        if root and os.path.exists(os.path.join(root, ".git")):
+            by_root.setdefault(root, []).append(p)
+    hit = set()
+    for root, group in by_root.items():
+        for i in range(0, len(group), 100):
+            chunk = group[i:i + 100]
+            rels = [os.path.relpath(p, root) for p in chunk]
             try:
-                t = os.readlink(f"{base}/fd/{fd}")
-            except OSError:
+                res = subprocess.run(["git", "-C", root, "ls-files", "-z", "--", *[":(literal)" + r for r in rels]],
+                                     capture_output=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                hit.update(chunk)
                 continue
-            if t.startswith("/") and hit(t):
-                kinds.setdefault("açık dosya", t)
-        try:
-            t = os.readlink(base + "/cwd")
-            if hit(t):
-                kinds.setdefault("çalışma dizini", t)
-        except OSError:
-            pass
-        try:
-            with open(base + "/maps", errors="replace") as f:
-                for line in f:
-                    if real not in line:
-                        continue
-                    parts = line.rstrip("\n").split(None, 5)
-                    if len(parts) == 6 and hit(parts[5]):
-                        kinds.setdefault("bellekte (mmap)", parts[5])
-                        break
-        except OSError:
-            pass
-        if kinds:
-            try:
-                with open(base + "/comm") as f:
-                    name = f.read().strip()
-            except OSError:
-                name = "?"
-            found.append((pid, name, ", ".join(kinds), next(iter(kinds.values()))))
-    found.sort()
-    return found, denied
+            if res.returncode != 0:
+                hit.update(chunk)
+                continue
+            files = [f.decode(errors="replace") for f in res.stdout.split(b"\0") if f]
+            for p, rel in zip(chunk, rels):
+                if any(f.startswith(rel + "/") for f in files):
+                    hit.add(p)
+    return hit
 
 
-class PssWorker(threading.Thread):
-    """PSS (paylasilan bellegi sureclere bolusturen gercek pay). memory_full_info ~0.5 sn surdugu icin
-    ana donguyu bloklamamak adina arka planda calisir; pids ana tarafta guncellenir."""
+class StatsWorker(threading.Thread):
+    """Surec basina PSS ve disk G/C hizlarini arka planda toplar (okumalar ana dongüyü bloklamasin).
+    helper (Yetkili okuma) varsa tum kullanicilarin surecleri ve dinleyen soketler root yardimcisindan gelir."""
 
     def __init__(self):
         super().__init__(daemon=True)
-        self.pids = []
-        self.pss = {}
+        self.helper = None
+        self.error = None
+        self.interval = 3.0
+        self.pss, self.io, self.socks = {}, {}, None
+        self.prev = {}
+        self.wake = threading.Event()
+
+    def sample(self):
+        helper, raw, socks = self.helper, None, None
+        t = time.monotonic()
+        if helper is not None:
+            try:
+                raw = {int(k): v for k, v in helper.request("stats", timeout=20).items()}
+                socks = [tuple(x) for x in helper.request("sockets", timeout=20)]
+            except HelperError as e:
+                if self.helper is helper:  # kullanici kapattiysa hata sayma
+                    self.error = str(e)
+                    self.helper = None
+                helper.stop()
+                raw = socks = None
+        if raw is None:
+            raw = read_stats()
+        pss, io, prev = {}, {}, {}
+        for pid, (p, rb, wb) in raw.items():
+            if p >= 0:
+                pss[pid] = p
+            if rb >= 0:
+                prev[pid] = (t, rb, wb)
+                old = self.prev.get(pid)
+                if old and t > old[0]:
+                    dt = t - old[0]
+                    io[pid] = (int(max(0, rb - old[1]) / dt), int(max(0, wb - old[2]) / dt))
+        self.prev = prev
+        self.pss, self.io, self.socks = pss, io, socks
 
     def run(self):
         while True:
-            pids, result = list(self.pids), {}
-            for pid in pids:
-                try:
-                    result[pid] = psutil.Process(pid).memory_full_info().pss
-                except (psutil.Error, OSError, AttributeError):
-                    pass
-            self.pss = result
-            time.sleep(3.0 if pids else 0.3)
+            try:
+                self.sample()
+            except Exception as e:  # noqa: BLE001 - arka plan okuyucusu hicbir hatada olmemeli
+                self.error = self.error or f"okuma hatası: {e}"
+            self.wake.wait(self.interval)
+            self.wake.clear()
 
 
 def process_details(pid):
@@ -531,6 +580,8 @@ def safe_delete(path, roots):
     real = os.path.realpath(path)
     if not any(real.startswith(os.path.realpath(os.path.expanduser(r)).rstrip("/") + "/") for r in roots):
         return False, "taranan klasörlerin dışında"
+    if tracked_dirs([real]):
+        return False, "git'te izlenen dosyalar içeriyor"
     try:
         shutil.rmtree(real)
     except OSError as e:
@@ -637,7 +688,7 @@ def docker_fetch(all_containers, on_partial):
             "id": d["ID"], "name": d.get("Names", ""), "project": proj.group(1) if proj else "",
             "image": d.get("Image", ""), "state": d.get("State", ""), "status": d.get("Status", ""),
             "ports": _docker_ports_text(d.get("Ports", "")),
-            "cpu": None, "mem": None, "net": None, "block": None, "pids": None,
+            "cpu": None, "mem": None, "net": None, "block": None, "pids": None, "limit": None,
         }
     on_partial(rows)
     if not any(r["state"] == "running" for r in rows.values()):
@@ -651,7 +702,10 @@ def docker_fetch(all_containers, on_partial):
         r = rows.get(d.get("ID"))
         if r:
             r["cpu"] = float(d.get("CPUPerc", "0").rstrip("%") or 0)
-            r["mem"] = parse_size(d.get("MemUsage", "").split("/")[0])
+            usage = d.get("MemUsage", "").split("/")
+            r["mem"] = parse_size(usage[0])
+            lim = parse_size(usage[1]) if len(usage) > 1 else 0
+            r["limit"] = 0 if lim >= 0.95 * psutil.virtual_memory().total else lim  # 0 = sinirsiz
             r["net"], r["block"] = d.get("NetIO", ""), d.get("BlockIO", "")
             r["pids"] = int(d.get("PIDs", 0) or 0)
     on_partial(rows)
@@ -788,6 +842,110 @@ class CoreGrid(SvgCanvas):
             out.append(f'<text x="{x + 6:.1f}" y="{y + 19}" font-size="11" fill="{fg}" fill-opacity="0.9">'
                        f'{i}: {v:.0f}%</text>')
         return "".join(out)
+
+
+class HistoryGraph(SvgCanvas):
+    """Gecmis grafigi: CPU % (mavi), RAM % (mor), en yuksek baski (kirmizi alan), takilma bantlari."""
+
+    def __init__(self):
+        super().__init__(190)
+        self.data = None
+
+    def set_data(self, data):
+        self.data = data
+        self.refresh()
+
+    def body(self, W, H):
+        fg = self.fg()
+        L, R, T, B = 38, 12, 24, 22
+        pw, ph = W - L - R, H - T - B
+        txt = f'fill="{fg}" fill-opacity="0.7" font-size="11"'
+        out = []
+        for pct in (0, 25, 50, 75, 100):
+            y = T + ph - pct / 100 * ph
+            out.append(f'<path d="M{L} {y:.1f}H{W - R}" stroke="{fg}" stroke-opacity="{0.35 if pct in (0, 100) else 0.12}" '
+                       f'fill="none"/><text x="{L - 5}" y="{y + 4:.1f}" text-anchor="end" {txt}>{pct}%</text>')
+        d = self.data
+        if not d or not d.get("rows"):
+            out.append(f'<text x="{L + pw / 2:.0f}" y="{T + ph / 2:.0f}" text-anchor="middle" fill="{fg}" fill-opacity="0.7" font-size="14">'
+                       f'Bu aralıkta kayıt yok</text>')
+            return "".join(out)
+        since, until, bucket = d["since"], max(d["until"], d["since"] + 1), d["bucket"]
+        span = until - since
+
+        def X(ts):
+            return L + (ts - since) / span * pw
+
+        def Y(v):
+            return T + ph - min(100.0, max(0.0, v)) / 100 * ph
+
+        fmt = "%H:%M" if span <= 86400 else "%d.%m %H:%M"
+        for i in range(5):
+            ts = since + span * i / 4
+            anchor = "start" if i == 0 else "end" if i == 4 else "middle"
+            out.append(f'<text x="{X(ts):.1f}" y="{H - 6}" text-anchor="{anchor}" {txt}>'
+                       f'{time.strftime(fmt, time.localtime(ts))}</text>')
+        for a, b in d.get("stalls", []):
+            x0, x1 = X(a), X(b + SYS_EVERY)
+            out.append(f'<rect x="{x0:.1f}" y="{T}" width="{max(2.0, x1 - x0):.1f}" height="{ph}" fill="#e5484d" '
+                       f'fill-opacity="0.13"/>')
+
+        def runs(points):
+            cur, last = [], None
+            for ts, v in points:
+                if last is not None and ts - last > 3 * bucket:
+                    yield cur
+                    cur = []
+                cur.append((ts, v))
+                last = ts
+            if cur:
+                yield cur
+
+        def draw(points, color, area):
+            for run in runs(points):
+                if len(run) == 1:
+                    out.append(f'<circle cx="{X(run[0][0]):.1f}" cy="{Y(run[0][1]):.1f}" r="2.5" fill="{color}"/>')
+                    continue
+                pts = " ".join(f"{X(ts):.1f},{Y(v):.1f}" for ts, v in run)
+                if area:
+                    out.append(f'<polygon points="{X(run[0][0]):.1f},{Y(0):.1f} {pts} {X(run[-1][0]):.1f},{Y(0):.1f}" '
+                               f'fill="{color}" fill-opacity="0.28"/>')
+                out.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.6" '
+                           f'stroke-linejoin="round"/>')
+
+        rows = d["rows"]
+        draw([(r[0], max(r[3] or 0, r[4] or 0, r[5] or 0)) for r in rows], "#e5484d", True)
+        draw([(r[0], r[2]) for r in rows if r[2] is not None], "#9966d9", False)
+        draw([(r[0], r[1]) for r in rows if r[1] is not None], "#338cd9", False)
+        ty = Y(d["thr"])
+        out.append(f'<path d="M{L} {ty:.1f}H{W - R}" stroke="#e5484d" stroke-opacity="0.6" stroke-dasharray="4 4" fill="none"/>')
+        out.append(f'<rect x="{L + 0.5}" y="{T + 0.5}" width="{pw - 1}" height="{ph - 1}" fill="none" stroke="{fg}" '
+                   f'stroke-opacity="0.35"/>')
+        x = L
+        for color, label in (("#338cd9", "CPU %"), ("#9966d9", "RAM %"), ("#e5484d", "En yüksek baskı (PSI)")):
+            out.append(f'<rect x="{x}" y="9" width="10" height="10" fill="{color}"/>'
+                       f'<text x="{x + 15}" y="18" {txt}>{label}</text>')
+            x += 28 + 7 * len(label)
+        return "".join(out)
+
+
+def simple_table(cols):
+    """cols: [(baslik, genislik, saga_hizali)] -> (ListStore, ScrolledWindow). Tum hucreler metin."""
+    store = Gtk.ListStore(*[str] * len(cols))
+    tv = Gtk.TreeView(model=store)
+    tv.set_enable_search(False)
+    for i, (title, width, right) in enumerate(cols):
+        r = Gtk.CellRendererText(ellipsize=3)
+        if right:
+            r.set_property("xalign", 1.0)
+        c = Gtk.TreeViewColumn(title, r, text=i)
+        c.set_resizable(True)
+        c.set_min_width(width)
+        c.set_expand(i == len(cols) - 1)
+        tv.append_column(c)
+    sc = Gtk.ScrolledWindow()
+    sc.add(tv)
+    return store, sc
 
 
 class StatBlock(Gtk.Grid):
@@ -970,8 +1128,34 @@ class TaskManager:
         self.proj_filter = None
         self.proj_iters = {}
         self.finder = None
-        self.pss_worker = PssWorker()
-        self.pss_worker.start()
+        self.stats = StatsWorker()
+        self.stats.start()
+        self.app = None
+        self.hidden = False       # pencere gizli (arka plan modu): arayuz guncellemeleri atlanir
+        self.quitting = False
+        self.priv_helper = None
+        self.priv_starting = False
+        self.priv_toggles = []
+        self._priv_sync = False
+        self.settings_win = None
+        self.hist_info_label = None
+        self.mem_note_t = -MEM_NOTE_COOLDOWN
+        self.idle_since = {}      # pid -> bosta gorulmeye basladigi an (monotonic)
+        self.prune_busy = False
+        self.last_prune = 0.0
+        self.hist_token = 0
+        self.git_cache = {}       # proje koku -> (zaman, dal, degisen dosya sayisi)
+        self.git_busy = False
+        self.clean_tracked = set()
+        self.svc_iters = {}
+        self.svc_query = ""
+        self.svc_busy = False
+        try:
+            self.history = History()
+        except (sqlite3.Error, OSError) as e:
+            print("gecmis veritabani acilamadi:", e, file=sys.stderr)
+            self.history = None
+        self.recorder = Recorder(self.history, self.pref("stall_psi")) if self.history else None
         self.last_socks = []
         self.docker_ports = {}
         self.docker_ports_t = 0.0
@@ -990,13 +1174,72 @@ class TaskManager:
         self.root = Gtk.Notebook()
         self.root.append_page(self.build_processes(), Gtk.Label(label="İşlemler"))
         self.root.append_page(self.build_performance(), Gtk.Label(label="Performans"))
+        self.root.append_page(self.build_history(), Gtk.Label(label="Geçmiş"))
         self.root.append_page(self.build_docker(), Gtk.Label(label="Docker"))
         self.root.append_page(self.build_projects(), Gtk.Label(label="Projeler"))
         self.root.append_page(self.build_ports(), Gtk.Label(label="Portlar"))
         self.root.append_page(self.build_clean(), Gtk.Label(label="Temizlik"))
+        self.root.append_page(self.build_services(), Gtk.Label(label="Servisler"))
+        btn_settings = Gtk.Button(label="⚙ Ayarlar")
+        btn_settings.set_relief(Gtk.ReliefStyle.NONE)
+        btn_settings.set_tooltip_text("Geçmiş kaydı, arka plan, bildirimler, otomatik temizlik (Ctrl+,)")
+        btn_settings.connect("clicked", lambda _b: self.open_settings())
+        btn_settings.show()
+        self.root.set_action_widget(btn_settings, Gtk.PackType.END)
         self.root.connect("switch-page", self.on_switch_page)
         self.refresh_processes()
         GLib.timeout_add(1000, self.tick)
+
+    # -------------------------------------------------------------- tercihler
+    def pref(self, key):
+        """Gecerli tercih degeri (dosyadaki bozuk / aralik disi deger varsayilana ya da sinira cekilir)."""
+        default = PREFS[key]
+        v = self.settings.get(key, default)
+        if isinstance(default, bool):
+            return v if isinstance(v, bool) else default
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return default
+        lo, hi = PREF_RANGE[key]
+        return int(min(hi, max(lo, v)))
+
+    def set_pref(self, key, value):
+        """Ayari hemen kaydeder (pencere kapanmadan da saklansin)."""
+        self.settings[key] = value
+        self.save_settings(self.win)
+
+    def log_event(self, kind, text):
+        if self.history is not None and self.pref("log_enabled"):
+            self.history.add_event(time.time(), kind, text)
+
+    def notify(self, title, body):
+        """Masaustu bildirimi (sistem tepsisi yok). Gio.Notification, olmazsa notify-send."""
+        app = Gio.Application.get_default()
+        try:
+            if app is not None and app.get_is_registered():
+                n = Gio.Notification.new(title)
+                n.set_body(body)
+                app.send_notification(None, n)
+                return
+        except (GLib.Error, TypeError):
+            pass
+        try:
+            subprocess.Popen(["notify-send", "-a", "Görev Yöneticisi", title, body],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def top_by(self, key, fmt, n=3):
+        best = sorted((p for p in self.last_procs if key(p) > 0), key=key, reverse=True)[:n]
+        return ", ".join(f"{p['name']} {fmt(key(p))}" for p in best) or "–"
+
+    def history_procs(self):
+        out = []
+        for r in self.last_procs:
+            out.append(dict(pid=r["pid"], name=r["name"],
+                            project=os.path.basename(self.proc_project.get(r["pid"]) or ""),
+                            cpu=r["cpu"], mem=r["pss"] or r["rss"],
+                            io_r=max(0, r.get("io_r", 0)), io_w=max(0, r.get("io_w", 0))))
+        return out
 
     # -------------------------------------------------------------- islemler sekmesi
     def build_processes(self):
@@ -1082,6 +1325,10 @@ class TaskManager:
             dict(key="pss", title="Bellek (PSS)", col=COL_PSS, sort=COL_PSS, width=120, xalign=1.0,
                  func=self.pss_cell),
             dict(key="ports", title="Portlar", col=COL_PORTS, sort=COL_PORTS, width=110),
+            dict(key="ior", title="Disk okuma", col=COL_IOR, sort=COL_IOR, width=105, xalign=1.0,
+                 func=self.io_cell(COL_IOR)),
+            dict(key="iow", title="Disk yazma", col=COL_IOW, sort=COL_IOW, width=105, xalign=1.0,
+                 func=self.io_cell(COL_IOW)),
             dict(key="threads", title="İş parçacığı", col=COL_THR, sort=COL_THR, width=110, xalign=1.0),
             dict(key="nice", title="Öncelik (nice)", col=COL_NICE, sort=COL_NICE, width=115, xalign=1.0,
                  visible=False),
@@ -1136,6 +1383,13 @@ class TaskManager:
         v = model.get_value(it, COL_PSS)
         r.set_property("text", fmt_bytes(v) if v else "–")
         heat(r, v / (2 << 30))
+
+    def io_cell(self, col):
+        def cell(_col, r, model, it, _data):
+            v = model.get_value(it, col)
+            r.set_property("text", fmt_rate(v) if v >= 0 else "–")
+            heat(r, max(0, v) / (50 << 20))
+        return cell
 
     def mem_cell(self, _col, r, model, it, _data):
         v = model.get_value(it, COL_RSS)
@@ -1537,6 +1791,8 @@ class TaskManager:
         if key == Gdk.KEY_f and ctrl:
             if page == TAB_DOCKER:
                 self.docker_search.grab_focus()
+            elif page == TAB_SERVICES:
+                self.svc_search.grab_focus()
             elif page == TAB_PORTS:
                 self.ports_search.grab_focus()
             else:
@@ -1546,9 +1802,19 @@ class TaskManager:
         if key == Gdk.KEY_o and ctrl:
             self.open_owner_finder()
             return True
+        if key == Gdk.KEY_comma and ctrl:
+            self.open_settings()
+            return True
+        if key == Gdk.KEY_q and ctrl:
+            self.quit_app()
+            return True
         if key == Gdk.KEY_F5:
             if page == TAB_DOCKER:
                 self.docker_refresh()
+            elif page == TAB_HISTORY:
+                self.refresh_history()
+            elif page == TAB_SERVICES:
+                self.services_refresh()
             else:
                 self.refresh_processes()
             return True
@@ -1569,7 +1835,8 @@ class TaskManager:
         shown, nums = ports_info(ports)
         search = f"{r['raw_name']} {r['name']} {r['cmd']} {r['cwd']} {r['pid']}{nums}".lower()
         return [r["pid"], r["name"], r["cpu"], r["rss"], r["threads"], r["user"], r["started"], r["cmd"],
-                r["cwd"], r["status"], r["ppid"], r["dotnet"], search, shown, nums, r.get("pss", 0), r["nice"]]
+                r["cwd"], r["status"], r["ppid"], r["dotnet"], search, shown, nums, r.get("pss", 0), r["nice"],
+                r.get("io_r", -1), r.get("io_w", -1)]
 
     def store_subtree(self, it, acc):
         acc.add(self.store[it][COL_PID])
@@ -1580,12 +1847,13 @@ class TaskManager:
 
     def refresh_processes(self):
         procs = collect(self.show_all_users)
-        pss = self.pss_worker.pss
+        pss, io = self.stats.pss, self.stats.io
         for r in procs:
             r["pss"] = pss.get(r["pid"], 0)
-        self.pss_worker.pids = [r["pid"] for r in procs if r["uid"] == ME]
+            r["io_r"], r["io_w"] = io.get(r["pid"], (-1, -1))
         self.last_procs = procs
-        self.last_socks = listening_sockets()
+        socks = self.stats.socks
+        self.last_socks = socks if socks is not None else listening_sockets()
         ports = listening_ports(self.last_socks)
         live = {r["pid"]: r for r in procs}
         self.update_stuck(procs)
@@ -1641,8 +1909,9 @@ class TaskManager:
             if pid in added:
                 continue
             it = self.iters[pid]
-            self.store.set(it, [COL_CPU, COL_RSS, COL_THR, COL_STATUS, COL_PPID, COL_PSS, COL_NICE],
-                           [r["cpu"], r["rss"], r["threads"], r["status"], r["ppid"], r["pss"], r["nice"]])
+            self.store.set(it, [COL_CPU, COL_RSS, COL_THR, COL_STATUS, COL_PPID, COL_PSS, COL_NICE, COL_IOR, COL_IOW],
+                           [r["cpu"], r["rss"], r["threads"], r["status"], r["ppid"], r["pss"], r["nice"],
+                            r["io_r"], r["io_w"]])
             shown, nums = ports_info(ports.get(pid))
             if self.store[it][COL_PORTNUMS] != nums:
                 row = self.row_for(r, ports.get(pid))
@@ -1733,7 +2002,121 @@ class TaskManager:
         self.stack.add_titled(make_page("Ağ",
                                         "<span foreground='#338cd9'>■</span> İndirme   <span foreground='#f29926'>■</span> Yükleme",
                                         self.g_net, self.s_net), "net", "Ağ")
+
+        self.g_psi = Graph([blue, purple, orange])
+        self.s_psi = StatBlock([("cpu", "CPU baskısı (10 sn / 60 sn / 5 dk)"),
+                                ("mem", "Bellek baskısı (10 sn / 60 sn / 5 dk)"),
+                                ("io", "Disk baskısı (10 sn / 60 sn / 5 dk)")], cols=3)
+        self.psi_top = Gtk.Label(label="", xalign=0, wrap=True, use_markup=True)
+        self.stack.add_titled(make_page(
+            "Baskı (PSI)",
+            "<span foreground='#338cd9'>■</span> CPU   <span foreground='#9966d9'>■</span> Bellek   "
+            "<span foreground='#f29926'>■</span> Disk   <span alpha='65%'>(işlerin kaynak beklediği zaman %)</span>",
+            self.g_psi, self.s_psi, self.psi_top), "psi", "Baskı (PSI)")
         return box
+
+    # -------------------------------------------------------------- gecmis sekmesi
+    def build_history(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bar = Gtk.Box(spacing=8)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(bar, f"set_margin_{m}")(8)
+        self.hist_range = Gtk.ComboBoxText()
+        for label, _secs in HISTORY_RANGES:
+            self.hist_range.append_text(label)
+        idx = self.settings.get("hist_range")
+        self.hist_range.set_active(idx if isinstance(idx, int) and 0 <= idx < len(HISTORY_RANGES) else 1)
+        self.hist_range.connect("changed", self.on_hist_range)
+        bar.pack_start(self.hist_range, False, False, 0)
+        btn = Gtk.Button(label="Yenile")
+        btn.connect("clicked", lambda _b: self.refresh_history())
+        bar.pack_start(btn, False, False, 0)
+        self.hist_hint = Gtk.Label(label="", xalign=0, use_markup=True)
+        self.hist_hint.set_ellipsize(3)
+        bar.pack_start(self.hist_hint, True, True, 0)
+        page.pack_start(bar, False, False, 0)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.hist_graph = HistoryGraph()
+        paned.pack1(self.hist_graph, True, False)
+        nb = Gtk.Notebook()
+        self.hist_stalls, sc = simple_table([("Başlangıç", 130, False), ("Süre", 90, True), ("Neden", 70, False),
+                                             ("Tepe baskı", 85, True), ("CPU", 60, True), ("RAM", 60, True),
+                                             ("Suçlular", 300, False)])
+        nb.append_page(sc, Gtk.Label(label="Takılma anları"))
+        self.hist_offs, sc = simple_table([("Süreç", 180, False), ("Proje", 140, False), ("Ort. CPU", 80, True),
+                                           ("En yüksek CPU", 100, True), ("En yüksek RAM", 100, True),
+                                           ("Ort. disk G/Y", 110, True), ("Görülme", 75, True)])
+        nb.append_page(sc, Gtk.Label(label="En çok yiyenler"))
+        self.hist_events, sc = simple_table([("Zaman", 130, False), ("Tür", 80, False), ("Olay", 400, False)])
+        nb.append_page(sc, Gtk.Label(label="Olaylar"))
+        paned.pack2(nb, True, False)
+        paned.set_position(270)
+        page.pack_start(paned, True, True, 0)
+        return page
+
+    def on_hist_range(self, combo):
+        self.set_pref("hist_range", combo.get_active())
+        self.refresh_history()
+
+    def refresh_history(self):
+        """Sorgular arka planda; eski sorgunun cevabi (token) yok sayilir."""
+        h = self.history
+        if h is None:
+            self.hist_hint.set_markup("<span foreground='#e8890c'>Geçmiş veritabanı açılamadı.</span>")
+            return
+        self.hist_token += 1
+        token, thr = self.hist_token, self.pref("stall_psi")
+        secs = HISTORY_RANGES[max(0, self.hist_range.get_active())][1]
+        until = time.time()
+
+        def work():
+            try:
+                span = h.span()
+                since = until - secs if secs else (span[0] if span else until - 3600)
+                bucket, rows = h.series(since, until)
+                res = dict(since=since, until=until, bucket=bucket, rows=rows, thr=thr, n=span[2] if span else 0,
+                           stall_rows=h.stalls(since, until, thr), offs=h.offenders(since, until),
+                           events=h.events(since, until))
+            except sqlite3.Error as e:
+                res = dict(error=str(e))
+            GLib.idle_add(self.on_history, token, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_history(self, token, res):
+        if token != self.hist_token:
+            return False
+        if "error" in res:
+            self.hist_hint.set_markup(f"<span foreground='#e8890c'>{GLib.markup_escape_text(res['error'])}</span>")
+            return False
+        stalls = res["stall_rows"]
+        res["stalls"] = [(w["start"], w["end"]) for w in stalls]
+        self.hist_graph.set_data(res)
+        self.hist_stalls.clear()
+        for w in stalls:
+            peak = {"cpu": w["psi_cpu"], "mem": w["psi_mem"], "io": w["psi_io"]}[w["cause"]]
+            culprits = []
+            for name, project, mcpu, mmem, mio in w["culprits"]:
+                val = {"cpu": f"CPU %{mcpu:.0f}", "mem": fmt_bytes(mmem), "io": fmt_rate(mio)}[w["cause"]]
+                culprits.append(f"{name}{f' ({project})' if project else ''} · {val}")
+            self.hist_stalls.append([fmt_ts(w["start"]), fmt_duration(w["end"] - w["start"] + SYS_EVERY),
+                                     CAUSE_TR[w["cause"]], f"%{peak:.0f}", f"%{w['cpu']:.0f}", f"%{w['mem']:.0f}",
+                                     "; ".join(culprits) or "–"])
+        self.hist_offs.clear()
+        for o in res["offs"]:
+            self.hist_offs.append([o["name"], o["project"] or "–", f"%{o['avg_cpu']:.1f}", f"%{o['max_cpu']:.0f}",
+                                   fmt_bytes(o["max_mem"]), fmt_rate(o["io_r"] + o["io_w"]),
+                                   f"%{o['seen'] * 100 / max(1, o['total']):.0f}"])
+        self.hist_events.clear()
+        for ts, kind, text in res["events"]:
+            self.hist_events.append([fmt_ts(ts), kind, text])
+        if not self.pref("log_enabled"):
+            hint = "<span foreground='#e8890c'>Geçmiş kaydı kapalı – Ayarlar'dan aç</span>"
+        else:
+            hint = (f"{res['n']} kayıt  │  {len(stalls)} takılma (baskı ≥ %{res['thr']})  │  "
+                    f"{self.pref('log_days')} gün saklanır")
+        self.hist_hint.set_markup(hint)
+        return False
 
     # -------------------------------------------------------------- docker sekmesi
     def build_docker(self):
@@ -1751,6 +2134,10 @@ class TaskManager:
         chk.connect("toggled", self.on_docker_all)
         bar.pack_start(chk, False, False, 0)
 
+        btn_proj = Gtk.Button(label="Aynı projeyi seç")
+        btn_proj.set_tooltip_text("Seçili konteynerlerin compose projesindeki tüm konteynerleri seç")
+        btn_proj.connect("clicked", lambda _b: self.docker_select_project())
+        bar.pack_end(btn_proj, False, False, 0)
         btn_rm = Gtk.Button(label="Sil")
         btn_rm.get_style_context().add_class("destructive-action")
         btn_rm.set_tooltip_text("docker rm -f (konteyner silinir, volume'lar kalır)")
@@ -1788,6 +2175,8 @@ class TaskManager:
             dict(key="state", title="Durum", col=D_STATE, sort=D_STATE, width=130, func=self.docker_state_cell),
             dict(key="cpu", title="CPU", col=D_CPU, sort=D_CPU, width=75, xalign=1.0, func=self.docker_cpu_cell),
             dict(key="mem", title="Bellek", col=D_MEM, sort=D_MEM, width=100, xalign=1.0, func=self.docker_mem_cell),
+            dict(key="limit", title="RAM sınırı", col=D_LIMIT, sort=D_LIMIT, width=150, xalign=1.0,
+                 func=self.docker_limit_cell),
             dict(key="net", title="Ağ G/Ç", col=D_NET, sort=D_NET, width=130),
             dict(key="block", title="Disk G/Ç", col=D_BLOCK, sort=D_BLOCK, width=130),
             dict(key="pids", title="PID sayısı", col=D_PIDS, sort=D_PIDS, width=100, xalign=1.0),
@@ -1828,6 +2217,29 @@ class TaskManager:
         r.set_property("text", fmt_bytes(v) if v else "–")
         heat(r, v / (2 << 30))
 
+    def docker_limit_cell(self, _col, r, model, it, _data):
+        v, mem = model.get_value(it, D_LIMIT), model.get_value(it, D_MEM)
+        if v < 0:
+            r.set_property("text", "–")
+        elif v == 0:
+            r.set_property("text", "sınırsız")
+        else:
+            r.set_property("text", f"{fmt_bytes(v)}  (%{mem * 100 / v:.0f})")
+        heat(r, mem / v if v > 0 else 0.0)
+
+    def docker_select_project(self):
+        model, paths = self.dtree.get_selection().get_selected_rows()
+        projects = {model[p][D_PROJECT] for p in paths if model[p][D_PROJECT]}
+        if not projects:
+            self.flash("Önce bir compose projesine ait konteyner seç.")
+            return
+        sel, n = self.dtree.get_selection(), 0
+        for row in self.dsort:
+            if row[D_PROJECT] in projects:
+                sel.select_path(row.path)
+                n += 1
+        self.flash(f"{n} konteyner seçildi ({', '.join(sorted(projects))}).")
+
     def on_docker_search(self, entry):
         self.docker_query = entry.get_text().strip().lower()
         self.dfilter.refilter()
@@ -1837,7 +2249,13 @@ class TaskManager:
         self.docker_refresh()
 
     def on_switch_page(self, _nb, _page, num):
-        if num == TAB_DOCKER:
+        if num == TAB_HISTORY:
+            self.refresh_history()
+        elif num == TAB_SERVICES:
+            self.services_refresh()
+        elif num == TAB_PROJECTS:
+            self.update_projects(force_git=True)
+        elif num == TAB_DOCKER:
             self.docker_refresh()
         elif num == TAB_PORTS:
             self.docker_ports_t = 0.0
@@ -1880,13 +2298,15 @@ class TaskManager:
             if it is None:
                 self.docker_iters[cid] = self.dstore.append([
                     cid, r["name"], r["project"], r["image"], r["state"], r["status"], r["cpu"] or 0.0,
-                    r["mem"] or 0, r["net"] or "", r["block"] or "", r["pids"] or 0, r["ports"], search])
+                    r["mem"] or 0, r["net"] or "", r["block"] or "", r["pids"] or 0, r["ports"], search,
+                    r["limit"] if r.get("limit") is not None else -1])
             else:
                 cols = [D_NAME, D_PROJECT, D_IMAGE, D_STATE, D_STATUS, D_PORTS, D_SEARCH]
                 vals = [r["name"], r["project"], r["image"], r["state"], r["status"], r["ports"], search]
                 if r["cpu"] is not None:
-                    cols += [D_CPU, D_MEM, D_NET, D_BLOCK, D_PIDS]
-                    vals += [r["cpu"], r["mem"], r["net"], r["block"], r["pids"]]
+                    cols += [D_CPU, D_MEM, D_NET, D_BLOCK, D_PIDS, D_LIMIT]
+                    vals += [r["cpu"], r["mem"], r["net"], r["block"], r["pids"],
+                             r["limit"] if r.get("limit") is not None else -1]
                 elif r["state"] != "running":
                     cols += [D_CPU, D_MEM, D_PIDS]
                     vals += [0.0, 0, 0]
@@ -2054,6 +2474,8 @@ class TaskManager:
             dict(key="cpu", title="CPU", col=P_CPU, sort=P_CPU, width=80, xalign=1.0, func=self.proj_cpu_cell),
             dict(key="mem", title="Bellek (PSS)", col=P_MEM, sort=P_MEM, width=110, xalign=1.0, func=self.proj_mem_cell),
             dict(key="dotnet", title="dotnet süreç", col=P_DOTNET, sort=P_DOTNET, width=125, xalign=1.0),
+            dict(key="branch", title="Git dalı", col=P_BRANCH, sort=P_BRANCH, width=150),
+            dict(key="dirty", title="Git durumu", col=P_DIRTY, sort=P_DIRTY, width=130, func=self.proj_dirty_cell),
             dict(key="path", title="Yol", col=P_PATH, sort=P_PATH, width=400, expand=True),
         ]
         self.jcols = ColumnSet(self.ptree, specs, self.settings.get("proj_columns"))
@@ -2078,7 +2500,43 @@ class TaskManager:
         r.set_property("text", fmt_bytes(v))
         heat(r, v / (4 << 30))
 
-    def update_projects(self):
+    def proj_dirty_cell(self, _col, r, model, it, _data):
+        v = model.get_value(it, P_DIRTY)
+        r.set_property("text", "–" if v < 0 else "temiz" if v == 0 else f"{v} değişiklik")
+        if v > 0:
+            r.set_property("foreground", "#e8890c")
+        else:
+            r.set_property("foreground-set", False)
+
+    def update_git(self, force=False):
+        """Git dali / degisiklik sayisi: arka planda, 15 sn'den eski kayitlar icin (Projeler sekmesi aciksa)."""
+        if self.git_busy or self.hidden:
+            return
+        now = time.monotonic()
+        visible = self.root.get_current_page() == TAB_PROJECTS
+        roots = [r for r in self.proj_iters if r]
+        stale = [r for r in roots
+                 if r not in self.git_cache or (visible and (force or now - self.git_cache[r][0] > 15))][:40]
+        if not stale:
+            return
+        self.git_busy = True
+
+        def work():
+            res = {root: git_status(root) for root in stale}
+            GLib.idle_add(self.on_git, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_git(self, res):
+        self.git_busy = False
+        t = time.monotonic()
+        for root, (branch, dirty) in res.items():
+            self.git_cache[root] = (t, branch, dirty)
+            it = self.proj_iters.get(root)
+            if it is not None:
+                self.pstore.set(it, [P_BRANCH, P_DIRTY], [branch, dirty])
+        return False
+
+    def update_projects(self, force_git=False):
         stats = {}
         for r in self.last_procs:
             root = self.proc_project.get(r["pid"], "")
@@ -2091,7 +2549,9 @@ class TaskManager:
             it = self.proj_iters.get(root)
             if it is None:
                 name = os.path.basename(root) if root else "(Proje dışı)"
-                self.proj_iters[root] = self.pstore.append([root, name, shorten_home(root), n, cpu, rss, dn])
+                _t, branch, dirty = self.git_cache.get(root, (0, "", -1))
+                self.proj_iters[root] = self.pstore.append([root, name, shorten_home(root), n, cpu, rss, dn,
+                                                            branch, dirty])
             else:
                 self.pstore.set(it, [P_COUNT, P_CPU, P_MEM, P_DOTNET], [n, cpu, rss, dn])
         for root in [x for x in self.proj_iters if x not in stats]:
@@ -2100,6 +2560,7 @@ class TaskManager:
         self.proj_status.set_text(
             f"Proje: {len(projects)}   │   projelerin toplam RAM'i: {fmt_bytes(sum(v[2] for v in projects))}"
             f"   (PSS: paylaşılan bellek süreçlere bölüştürülür)")
+        self.update_git(force_git)
 
     def project_selected(self):
         model, paths = self.ptree.get_selection().get_selected_rows()
@@ -2152,6 +2613,7 @@ class TaskManager:
         self.ports_search = Gtk.SearchEntry(placeholder_text="Ara: port, süreç, proje, konteyner…")
         self.ports_search.connect("search-changed", self.on_ports_search)
         bar.pack_start(self.ports_search, True, True, 0)
+        bar.pack_start(self.make_priv_toggle("Yetkili okuma"), False, False, 0)
         b_kill = Gtk.Button(label="Zorla sonlandır")
         b_kill.get_style_context().add_class("destructive-action")
         b_kill.set_tooltip_text("Süreç: SIGKILL · Docker: docker kill")
@@ -2330,6 +2792,7 @@ class TaskManager:
             dict(key="project", title="Proje", col=C_PROJECT, sort=C_PROJECT, width=220, hideable=False),
             dict(key="kind", title="Tür", col=C_KIND, sort=C_KIND, width=160),
             dict(key="size", title="Boyut", col=C_SIZE, sort=C_SIZE, width=110, xalign=1.0, func=self.clean_size_cell),
+            dict(key="git", title="Git", col=C_GIT, sort=C_GIT, width=140),
             dict(key="path", title="Yol", col=C_SHOWN, sort=C_SHOWN, width=500, expand=True),
         ]
         self.ccols = ColumnSet(self.ctree, specs, self.settings.get("clean_columns"))
@@ -2399,17 +2862,20 @@ class TaskManager:
 
         def work():
             found = scan_clean(roots)
-            sizes = dir_sizes([p for p, _pr, _k in found])
-            GLib.idle_add(self.on_clean_done, found, sizes)
+            paths = [p for p, _pr, _k in found]
+            sizes = dir_sizes(paths)
+            GLib.idle_add(self.on_clean_done, found, sizes, tracked_dirs(paths))
         threading.Thread(target=work, daemon=True).start()
         self.docker_df_refresh()
 
-    def on_clean_done(self, found, sizes):
+    def on_clean_done(self, found, sizes, tracked=()):
         self.clean_busy = False
+        self.clean_tracked = set(tracked)
         self.cstore.clear()
         self.clean_iters.clear()
         for path, proj, kind in found:
-            self.clean_iters[path] = self.cstore.append([path, proj, kind, sizes.get(path, 0), shorten_home(path)])
+            self.clean_iters[path] = self.cstore.append([path, proj, kind, sizes.get(path, 0), shorten_home(path),
+                                                         "git'te izleniyor" if path in self.clean_tracked else ""])
         self.update_clean_status()
         return False
 
@@ -2436,9 +2902,13 @@ class TaskManager:
         if busy:
             names = ", ".join(sorted({f"{n} ({pid})" for v in busy.values() for pid, n in v})[:5])
             detail += f"\n\nÇalışma dizini bu klasörlerde olan süreçler var, bu klasörler atlanır: {names}"
+        tracked = {p for p, *_r in sel if p in self.clean_tracked}
+        if tracked:
+            detail += (f"\n\n{len(tracked)} klasörde git'in izlediği dosyalar var (depoya eklenmiş); "
+                       f"bunlar silinmez.")
         if not self.confirm(f"{len(sel)} klasör silinsin mi? ({fmt_bytes(total)})", detail, "Sil"):
             return
-        todo = [s for s in sel if s[0] not in busy]
+        todo = [s for s in sel if s[0] not in busy and s[0] not in tracked]
         roots = list(self.clean_roots)
         self.clean_status.set_text("Siliniyor…")
 
@@ -2460,7 +2930,7 @@ class TaskManager:
                 errs.append(f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}: {err}")
         msg = f"{fmt_bytes(freed)} boşaltıldı."
         if skipped:
-            msg += f"  {skipped} klasör kullanımda olduğu için atlandı."
+            msg += f"  {skipped} klasör kullanımda ya da git'te izlendiği için atlandı."
         if errs:
             msg += "  Hata: " + "; ".join(errs[:2])
         self.flash(msg, 10)
@@ -2503,6 +2973,180 @@ class TaskManager:
         return False
 
     # -------------------------------------------------------------- dosya / klasor sahibi
+    # -------------------------------------------------------------- ayarlar penceresi
+    def open_settings(self):
+        if self.settings_win is not None:
+            self.settings_win.present()
+            return
+        dlg = self.settings_win = Gtk.Dialog(title="Ayarlar")
+        if self.toplevel():
+            dlg.set_transient_for(self.toplevel())
+        dlg.set_default_size(580, 700)
+        dlg.add_button("Kapat", Gtk.ResponseType.CLOSE)
+        dlg.connect("response", lambda d, _r: d.destroy())
+        dlg.connect("destroy", self.on_settings_closed)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(16)
+        scroll.add(box)
+        dlg.get_content_area().pack_start(scroll, True, True, 0)
+        widgets = dlg.test_parts = {}
+
+        def section(title):
+            lbl = Gtk.Label(label="", xalign=0)
+            lbl.set_markup(f"<span size='large' weight='bold'>{title}</span>")
+            lbl.set_margin_top(10)
+            box.pack_start(lbl, False, False, 0)
+
+        def note(text):
+            lbl = Gtk.Label(label=text, xalign=0, wrap=True)
+            lbl.get_style_context().add_class("dim-label")
+            box.pack_start(lbl, False, False, 0)
+            return lbl
+
+        def check(text, key, tip=None):
+            chk = Gtk.CheckButton(label=text)
+            chk.set_active(self.pref(key))
+            if tip:
+                chk.set_tooltip_text(tip)
+            chk.connect("toggled", lambda b: self.set_pref(key, b.get_active()))
+            box.pack_start(chk, False, False, 0)
+            widgets[key] = chk
+            return chk
+
+        def spin_row(text, key, unit):
+            row = Gtk.Box(spacing=8)
+            row.pack_start(Gtk.Label(label=text, xalign=0), True, True, 0)
+            lo, hi = PREF_RANGE[key]
+            sp = Gtk.SpinButton.new_with_range(lo, hi, 1)
+            sp.set_value(self.pref(key))
+            sp.connect("value-changed", lambda b: self.set_pref(key, int(b.get_value())))
+            row.pack_start(sp, False, False, 0)
+            row.pack_start(Gtk.Label(label=unit, xalign=0), False, False, 0)
+            box.pack_start(row, False, False, 0)
+            widgets[key] = sp
+
+        section("Geçmiş")
+        check("Geçmişi diske kaydet", "log_enabled",
+              "Sistem yükü ~10 sn'de, en çok kaynak kullanan süreçler dakikada bir (takılma anında 10 sn'de bir) yazılır")
+        spin_row("Kayıtları şu kadar gün sakla", "log_days", "gün")
+        spin_row("Takılma eşiği (baskı)", "stall_psi", "%")
+        self.hist_info_label = note("")
+        widgets["hist_info"] = self.hist_info_label
+        note("Süresi dolan kayıtlar açılışta ve saatte bir otomatik silinir. Süreyi değiştirince hemen silinmesini "
+             "istiyorsan aşağıdaki düğmeyi kullan.")
+        row = Gtk.Box(spacing=8)
+        b_prune = Gtk.Button(label="Şimdi eski kayıtları sil")
+        b_prune.set_tooltip_text("Saklama süresinden eski kayıtları şimdi siler")
+        b_prune.connect("clicked", lambda _b: self.settings_prune())
+        b_clear = Gtk.Button(label="Tüm geçmişi sil")
+        b_clear.get_style_context().add_class("destructive-action")
+        b_clear.connect("clicked", lambda _b: self.settings_clear())
+        row.pack_start(b_prune, False, False, 0)
+        row.pack_start(b_clear, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        widgets["prune"], widgets["clear"] = b_prune, b_clear
+
+        section("Arka plan")
+        check("Pencere kapanınca arka planda çalışmaya devam et", "bg_run",
+              "Kapalıysa pencereyi kapatmak uygulamadan çıkar ve geçmiş kaydı durur")
+        auto = Gtk.CheckButton(label="Oturum açılınca arka planda başlat")
+        auto.set_active(tm_services.self_autostart_enabled())
+        auto.connect("toggled", self.on_self_autostart)
+        box.pack_start(auto, False, False, 0)
+        widgets["autostart"] = auto
+
+        section("Bildirimler")
+        check("RAM dolmaya yaklaşınca masaüstü bildirimi gönder", "notify_mem")
+        spin_row("RAM doluluk eşiği", "notify_mem_pct", "%")
+
+        section("Otomatik temizlik")
+        check("Boşta kalan MSBuild node / VBCSCompiler'ı otomatik kapat", "auto_idle",
+              "Yalnızca RAM aşağıdaki eşiğin üstündeyken ve süreç belirtilen süre boyunca boştayken (CPU < %2)")
+        spin_row("Şu kadar dakika boşta kalırsa", "auto_idle_min", "dk")
+        spin_row("RAM doluluğu en az", "auto_idle_mem", "%  (0 = her zaman)")
+        b_srv = Gtk.Button(label="dotnet build-server shutdown")
+        b_srv.set_halign(Gtk.Align.START)
+        b_srv.set_tooltip_text("Tüm dotnet derleme sunucularını (MSBuild, VBCSCompiler, Razor) kapatır")
+        b_srv.connect("clicked", lambda _b: self.build_server_shutdown())
+        box.pack_start(b_srv, False, False, 0)
+
+        section("Yetkili okuma")
+        box.pack_start(self.make_priv_toggle("Yetkili okuma (root, salt okunur)"), False, False, 0)
+        note("Parola sorar. Başka kullanıcıların süreçleri için port, bellek (PSS), disk G/Ç ve dosya sahibi bilgisini "
+             "gösterir. Her oturumda yeniden açılır.")
+
+        b_quit = Gtk.Button(label="Tamamen çık")
+        b_quit.set_halign(Gtk.Align.START)
+        b_quit.set_margin_top(14)
+        b_quit.set_tooltip_text("Uygulamadan çıkar; geçmiş kaydı durur (Ctrl+Q)")
+        b_quit.connect("clicked", lambda _b: self.quit_app())
+        box.pack_start(b_quit, False, False, 0)
+        widgets["quit"] = b_quit
+        dlg.show_all()
+        self.update_history_info()
+
+    def on_settings_closed(self, _dlg):
+        self.settings_win = None
+        self.hist_info_label = None
+
+    def on_self_autostart(self, chk):
+        path = os.path.realpath(__file__)
+        err = tm_services.write_self_autostart(f'{sys.executable} "{path}" --background', chk.get_active())
+        if err:
+            self.flash(f"Oturum açılışı ayarı yazılamadı: {err}", 10)
+
+    def update_history_info(self):
+        h = self.history
+        if h is None or self.hist_info_label is None:
+            return
+
+        def work():
+            try:
+                size, span = h.size(), h.span()
+            except sqlite3.Error:
+                size, span = 0, None
+            GLib.idle_add(self.show_history_info, size, span)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_history_info(self, size, span):
+        if self.hist_info_label is not None:
+            if span:
+                self.hist_info_label.set_text(f"Veritabanı: {fmt_bytes(size)}  │  {span[2]} kayıt  │  "
+                                              f"{fmt_ts(span[0])} – {fmt_ts(span[1])}")
+            else:
+                self.hist_info_label.set_text(f"Veritabanı: {fmt_bytes(size)}  │  henüz kayıt yok")
+        return False
+
+    def settings_prune(self):
+        days = self.pref("log_days")
+        if not self.confirm(f"{days} günden eski kayıtlar silinsin mi?", "Bu işlem geri alınamaz.", "Sil"):
+            return
+        self.prune_history(days, self.after_settings_delete)
+
+    def settings_clear(self):
+        h = self.history
+        if h is None or not self.confirm("Tüm geçmiş silinsin mi?", "Kaydedilmiş bütün kayıtlar silinir.",
+                                         "Hepsini sil"):
+            return
+
+        def work():
+            try:
+                h.clear()
+            except sqlite3.Error:
+                pass
+            GLib.idle_add(self.after_settings_delete, 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_settings_delete(self, n):
+        self.flash("Geçmiş silindi." if n <= 0 else f"{n} eski kayıt silindi.", 8)
+        self.update_history_info()
+        if self.root.get_current_page() == TAB_HISTORY:
+            self.refresh_history()
+        return False
+
     def open_owner_finder(self):
         if self.finder is not None:
             self.finder.present()
@@ -2521,7 +3165,7 @@ class TaskManager:
         btn_dir = Gtk.Button(label="Klasör seç…")
         btn_go = Gtk.Button(label="Ara")
         btn_go.get_style_context().add_class("suggested-action")
-        for w in (entry, btn_file, btn_dir, btn_go):
+        for w in (entry, btn_file, btn_dir, self.make_priv_toggle("Yetkili (root) tara"), btn_go):
             top.pack_start(w, w is entry, True, 0)
         box.pack_start(top, False, False, 0)
 
@@ -2564,7 +3208,14 @@ class TaskManager:
             info.set_text("Taranıyor…")
 
             def work():
-                found, denied = find_owners(path)
+                helper, found = self.priv_helper, None
+                if helper is not None and helper.alive:
+                    try:
+                        found, denied = helper.request("owners", timeout=180, path=path)
+                    except HelperError:
+                        found = None
+                if found is None:
+                    found, denied = find_owners(path)
                 GLib.idle_add(done, found, denied)
             threading.Thread(target=work, daemon=True).start()
 
@@ -2575,7 +3226,7 @@ class TaskManager:
                 store.append(list(row))
             msg = f"{len(found)} süreç bu yolu kullanıyor." if found else "Bu yolu kullanan bir süreç bulunamadı."
             if denied:
-                msg += f"  ({denied} sürecin dosyaları okunamadı; başka kullanıcılara ait olabilir, sudo gerekir.)"
+                msg += f"  ({denied} sürecin dosyaları okunamadı; başka kullanıcılara ait olabilir – 'Yetkili tara'yı aç.)"
             info.set_text(msg)
             return False
 
@@ -2623,6 +3274,164 @@ class TaskManager:
         entry.grab_focus()
         win.test_parts = (entry, store, info, btn_go)  # testler icin
 
+    # -------------------------------------------------------------- servisler sekmesi
+    def build_services(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bar = Gtk.Box(spacing=8)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(bar, f"set_margin_{m}")(8)
+        self.svc_search = Gtk.SearchEntry(placeholder_text="Ara: servis, uygulama, açıklama…")
+        self.svc_search.connect("search-changed", self.on_svc_search)
+        bar.pack_start(self.svc_search, True, True, 0)
+        for label, verb, tip in (("Yenile", None, "Listeyi yenile (F5)"),
+                                 ("Başlangıçta kapat", "disable", "Oturum açılınca başlamasın"),
+                                 ("Başlangıçta aç", "enable", "Oturum açılınca başlasın"),
+                                 ("Yeniden başlat", "restart", None), ("Durdur", "stop", None),
+                                 ("Başlat", "start", None)):
+            b = Gtk.Button(label=label)
+            if tip:
+                b.set_tooltip_text(tip)
+            if verb is None:
+                b.connect("clicked", lambda _b: self.services_refresh())
+            else:
+                b.connect("clicked", lambda _b, v=verb: self.service_action(v))
+            bar.pack_end(b, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
+        self.sstore = Gtk.ListStore(*S_TYPES)
+        self.sfilter = self.sstore.filter_new()
+        self.sfilter.set_visible_func(
+            lambda m, it, _d: not self.svc_query or self.svc_query in m.get_value(it, S_SEARCH))
+        self.ssort = Gtk.TreeModelSort(model=self.sfilter)
+        self.stree = Gtk.TreeView(model=self.ssort)
+        self.stree.set_enable_search(False)
+        self.stree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        specs = [
+            dict(key="name", title="Ad", col=S_NAME, sort=S_NAME, width=280, hideable=False),
+            dict(key="kind", title="Tür", col=S_KIND, sort=S_KIND, width=150),
+            dict(key="state", title="Durum", col=S_STATE, sort=S_STATE, width=120, func=self.svc_state_cell),
+            dict(key="boot", title="Başlangıçta", col=S_BOOT, sort=S_BOOT, width=110),
+            dict(key="mem", title="Bellek", col=S_MEM, sort=S_MEM, width=100, xalign=1.0, func=self.svc_mem_cell),
+            dict(key="desc", title="Açıklama / komut", col=S_DESC, sort=S_DESC, width=400, expand=True),
+        ]
+        self.scols = ColumnSet(self.stree, specs, self.settings.get("services_columns"))
+        self.scols.apply_sort(self.ssort, self.settings.get("services_sort"), ["state", "asc"])
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(self.stree)
+        page.pack_start(scroll, True, True, 0)
+        self.svc_status = Gtk.Label(label="Servisler sekmesi açılınca yüklenir.", xalign=0)
+        for m in ("start", "end"):
+            getattr(self.svc_status, f"set_margin_{m}")(10)
+        self.svc_status.set_margin_top(5)
+        self.svc_status.set_margin_bottom(5)
+        page.pack_start(self.svc_status, False, False, 0)
+        return page
+
+    def svc_state_cell(self, _col, r, model, it, _data):
+        st = model.get_value(it, S_STATE)
+        label, color = SERVICE_STATES.get(st, (st or "–", None))
+        r.set_property("text", ("● " if st == "active" else "") + label)
+        if color:
+            r.set_property("foreground", color)
+        else:
+            r.set_property("foreground-set", False)
+
+    def svc_mem_cell(self, _col, r, model, it, _data):
+        v = model.get_value(it, S_MEM)
+        r.set_property("text", fmt_bytes(v) if v else "–")
+        heat(r, v / (2 << 30))
+
+    def on_svc_search(self, entry):
+        self.svc_query = entry.get_text().strip().lower()
+        self.sfilter.refilter()
+
+    def services_refresh(self):
+        if self.svc_busy:
+            return
+        self.svc_busy = True
+
+        def work():
+            units, err = tm_services.list_user_services()
+            apps = tm_services.list_autostart()
+            GLib.idle_add(self.on_services, units, apps, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_services(self, units, apps, err):
+        self.svc_busy = False
+        rows = {}
+        for u in units:
+            rows["svc:" + u["unit"]] = [u["unit"], "Kullanıcı servisi", u["active"],
+                                        BOOT_TR.get(u["enabled"], u["enabled"] or "–"), u["mem"], u["desc"]]
+        for a in apps:
+            rows["app:" + a["file"]] = [a["name"], "Başlangıç uygulaması" + (" (sistem)" if a["system"] else ""), "",
+                                        "açık" if a["enabled"] else "kapalı", 0, a["exec"]]
+        for key, (name, kind, state, boot, mem, desc) in rows.items():
+            search = f"{name} {kind} {desc}".lower()
+            it = self.svc_iters.get(key)
+            if it is None:
+                self.svc_iters[key] = self.sstore.append([key, name, kind, state, boot, mem, desc, search])
+            else:
+                self.sstore.set(it, [S_NAME, S_KIND, S_STATE, S_BOOT, S_MEM, S_DESC, S_SEARCH],
+                                [name, kind, state, boot, mem, desc, search])
+        for key in [k for k in self.svc_iters if k not in rows]:
+            self.sstore.remove(self.svc_iters.pop(key))
+        running = sum(1 for r in rows.values() if r[2] == "active")
+        failed = sum(1 for r in rows.values() if r[2] == "failed")
+        text = (f"Servis: {len(units)} ({running} çalışıyor)   │   başlangıç uygulaması: {len(apps)}"
+                + (f"   │   {failed} başarısız" if failed else ""))
+        if err:
+            text += f"   │   systemctl hatası: {err}"
+        self.svc_status.set_text(text)
+        return False
+
+    def services_selected(self):
+        model, paths = self.stree.get_selection().get_selected_rows()
+        return [(model[p][S_KEY], model[p][S_NAME]) for p in paths]
+
+    def service_action(self, verb):
+        sel = self.services_selected()
+        if not sel:
+            self.flash("Önce listeden bir servis ya da uygulama seç.")
+            return
+        if verb in ("start", "stop", "restart"):
+            sel = [x for x in sel if x[0].startswith("svc:")]
+            if not sel:
+                self.flash("Başlat / durdur / yeniden başlat yalnızca servisler için; uygulamalarda 'Başlangıçta aç/kapat' kullan.")
+                return
+        if verb in ("stop", "restart", "disable"):
+            prot = [n for k, n in sel if k.startswith("svc:") and k[4:].startswith(PROTECTED_SERVICES)]
+            if prot:
+                self.flash(f"Korumalı servis (oturumu bozar): {', '.join(prot)}", 8)
+                sel = [x for x in sel if x[1] not in prot]
+                if not sel:
+                    return
+        if verb in ("stop", "disable"):
+            what = "durdurulsun" if verb == "stop" else "başlangıçta kapatılsın"
+            listing = "\n".join(n for _k, n in sel[:10])
+            if not self.confirm(f"{len(sel)} öğe {what} mı?", listing, "Evet"):
+                return
+
+        def work():
+            errs = []
+            for key, name in sel:
+                if key.startswith("svc:"):
+                    err = tm_services.service_action(key[4:], verb)
+                else:
+                    err = tm_services.set_autostart(key[4:], verb == "enable")
+                if err:
+                    errs.append(f"{name}: {err}")
+            GLib.idle_add(self.after_service_action, verb, len(sel), errs)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_service_action(self, verb, n, errs):
+        words = {"start": "başlatıldı", "stop": "durduruldu", "restart": "yeniden başlatıldı",
+                 "enable": "başlangıçta açıldı", "disable": "başlangıçta kapatıldı"}
+        msg = f"{n - len(errs)} öğe {words[verb]}." + (f"  Hata: {errs[0]}" if errs else "")
+        self.flash(msg, 8)
+        self.svc_busy = False
+        self.services_refresh()
+        return False
+
     # -------------------------------------------------------------- periyodik
     def tick(self):
         self.tick_n += 1
@@ -2645,56 +3454,268 @@ class TaskManager:
         self.g_disk.push(rd, wr)
         self.g_net.push(dn, up)
 
-        freq = psutil.cpu_freq()
+        psi = read_psi()
+        pc, pm, pio = psi_some10(psi)
+        self.g_psi.push(pc, pm, pio)
         load = os.getloadavg()
-        up_s = int(time.time() - psutil.boot_time())
-        self.s_cpu.set("use", f"{self.cpu_pct:.0f}%")
-        self.s_cpu.set("freq", f"{freq.current / 1000:.2f} GHz" if freq else "–")
-        self.s_cpu.set("proc", str(len(psutil.pids())))
-        self.s_cpu.set("up", f"{up_s // 86400}:{up_s % 86400 // 3600:02d}:{up_s % 3600 // 60:02d}:{up_s % 60:02d}")
-        self.s_cpu.set("load", f"{load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}")
-        self.s_cpu.set("cores", str(NCPU))
-        self.s_mem.set("use", fmt_bytes(vm.used))
-        self.s_mem.set("avail", fmt_bytes(vm.available))
-        self.s_mem.set("cache", fmt_bytes(getattr(vm, "cached", 0) + getattr(vm, "buffers", 0)))
-        self.s_mem.set("total", fmt_bytes(vm.total))
-        self.s_mem.set("swap", f"{fmt_bytes(sw.used)} / {fmt_bytes(sw.total)}")
-        self.s_mem.set("pct", f"{vm.percent:.0f}%")
-        self.s_disk.set("r", fmt_bytes(rd) + "/s")
-        self.s_disk.set("w", fmt_bytes(wr) + "/s")
-        self.s_disk.set("rt", fmt_bytes(disk.read_bytes))
-        self.s_disk.set("wt", fmt_bytes(disk.write_bytes))
-        self.s_net.set("d", fmt_bytes(dn) + "/s")
-        self.s_net.set("u", fmt_bytes(up) + "/s")
-        self.s_net.set("dt", fmt_bytes(net.bytes_recv))
-        self.s_net.set("ut", fmt_bytes(net.bytes_sent))
 
-        self.hdr_cpu.set_markup(f"<b>{self.cpu_pct:.0f}%</b>\nCPU")
-        self.hdr_mem.set_markup(f"<b>{vm.percent:.0f}%</b>\nBellek")
+        if not self.hidden:
+            freq = psutil.cpu_freq()
+            up_s = int(time.time() - psutil.boot_time())
+            self.s_cpu.set("use", f"{self.cpu_pct:.0f}%")
+            self.s_cpu.set("freq", f"{freq.current / 1000:.2f} GHz" if freq else "–")
+            self.s_cpu.set("proc", str(len(psutil.pids())))
+            self.s_cpu.set("up", f"{up_s // 86400}:{up_s % 86400 // 3600:02d}:{up_s % 3600 // 60:02d}:{up_s % 60:02d}")
+            self.s_cpu.set("load", f"{load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}")
+            self.s_cpu.set("cores", str(NCPU))
+            self.s_mem.set("use", fmt_bytes(vm.used))
+            self.s_mem.set("avail", fmt_bytes(vm.available))
+            self.s_mem.set("cache", fmt_bytes(getattr(vm, "cached", 0) + getattr(vm, "buffers", 0)))
+            self.s_mem.set("total", fmt_bytes(vm.total))
+            self.s_mem.set("swap", f"{fmt_bytes(sw.used)} / {fmt_bytes(sw.total)}")
+            self.s_mem.set("pct", f"{vm.percent:.0f}%")
+            self.s_disk.set("r", fmt_bytes(rd) + "/s")
+            self.s_disk.set("w", fmt_bytes(wr) + "/s")
+            self.s_disk.set("rt", fmt_bytes(disk.read_bytes))
+            self.s_disk.set("wt", fmt_bytes(disk.write_bytes))
+            self.s_net.set("d", fmt_bytes(dn) + "/s")
+            self.s_net.set("u", fmt_bytes(up) + "/s")
+            self.s_net.set("dt", fmt_bytes(net.bytes_recv))
+            self.s_net.set("ut", fmt_bytes(net.bytes_sent))
+            for key, res in (("cpu", "cpu"), ("mem", "memory"), ("io", "io")):
+                a = psi.get(res, {}).get("some")
+                self.s_psi.set(key, f"{a[0]:.1f}%  ·  {a[1]:.1f}%  ·  {a[2]:.1f}%" if a else "bu çekirdekte yok")
+            self.hdr_cpu.set_markup(f"<b>{self.cpu_pct:.0f}%</b>\nCPU")
+            self.hdr_mem.set_markup(f"<b>{vm.percent:.0f}%</b>\nBellek")
+            page = self.root.get_current_page()
+            if page == TAB_PERFORMANCE and self.stack.get_visible_child_name() == "psi" and self.tick_n % 2 == 0:
+                self.update_psi_top()
+            elif page == TAB_HISTORY and self.tick_n % 30 == 0:
+                self.refresh_history()
+            elif page == TAB_SERVICES and self.tick_n % 10 == 0:
+                self.services_refresh()
 
-        if self.tick_n % 2 == 1 and not self.paused and not self.menu_open:
+        refreshed = False
+        due = self.tick_n % 10 == 1 if self.hidden else self.tick_n % 2 == 1
+        if due and not self.paused and not self.menu_open:
             self.refresh_processes()
+            refreshed = True
         elif time.monotonic() >= self.flash_until and self.flash_text:
             self.flash_text = ""
             self.update_status()
             self.update_docker_status()
-        if (self.root.get_current_page() == TAB_DOCKER and self.tick_n % 4 == 0 and not self.paused
-                and not self.docker_busy):
+        if (not self.hidden and self.root.get_current_page() == TAB_DOCKER and self.tick_n % 4 == 0
+                and not self.paused and not self.docker_busy):
             self.docker_refresh()
+        self.check_helper()
+        self.background_work(vm, (self.cpu_pct, vm.percent, sw.percent, pc, pm, pio, load[0], int(rd), int(wr)),
+                             refreshed)
         return True
+
+    def update_psi_top(self):
+        cpu = self.top_by(lambda p: p["cpu"], lambda v: f"%{v:.0f}")
+        mem = self.top_by(lambda p: p["pss"] or p["rss"], fmt_bytes)
+        io = self.top_by(lambda p: max(0, p.get("io_r", 0)) + max(0, p.get("io_w", 0)), fmt_rate)
+        esc = GLib.markup_escape_text
+        self.psi_top.set_markup(f"<b>Şu an en çok kullananlar</b>\nCPU: {esc(cpu)}\nBellek: {esc(mem)}\n"
+                                f"Disk: {esc(io)}")
+
+    # -------------------------------------------------------------- arka plan isleri
+    def background_work(self, vm, sysrow, refreshed):
+        """Pencere gizliyken de her saniye calisir: kayit, bellek uyarisi, otomatik temizlik, eski kayit silme."""
+        now = time.time()
+        if self.recorder is not None and self.pref("log_enabled"):
+            self.recorder.stall_psi = self.pref("stall_psi")
+            self.recorder.step(now, sysrow, self.history_procs)
+        if (self.pref("notify_mem") and vm.percent >= self.pref("notify_mem_pct")
+                and now - self.mem_note_t >= MEM_NOTE_COOLDOWN):
+            self.mem_note_t = now
+            msg = (f"RAM %{vm.percent:.0f} dolu. En çok yiyenler: "
+                   f"{self.top_by(lambda p: p['pss'] or p['rss'], fmt_bytes)}")
+            self.notify("Bellek azalıyor", msg)
+            self.log_event("bellek", msg)
+        if refreshed:
+            self.auto_idle_step(vm.percent)
+        if self.history is not None and time.monotonic() - self.last_prune > 3600:
+            self.last_prune = time.monotonic()
+            self.prune_history()
+
+    def auto_idle_step(self, mem_pct):
+        """Bosta (CPU < %2) MSBuild node / VBCSCompiler'lari, RAM yuksekse ve yeterince uzun sure bosta kaldiysa kapat."""
+        nodes, comps = self.cleanup_targets()
+        now = time.monotonic()
+        idle = {r["pid"]: self.idle_since.get(r["pid"], now) for r in nodes + comps}
+        self.idle_since = idle
+        if not self.pref("auto_idle") or mem_pct < self.pref("auto_idle_mem"):
+            return
+        limit = self.pref("auto_idle_min") * 60
+        old = [r for r in nodes + comps if now - idle[r["pid"]] >= limit]
+        if not old:
+            return
+        kill_pids([r["pid"] for r in old], signal.SIGTERM, False)
+        msg = (f"Otomatik temizlik: boşta bekleyen {len(old)} MSBuild/VBCSCompiler kapatıldı "
+               f"({fmt_bytes(sum(r['rss'] for r in old))}), RAM %{mem_pct:.0f}.")
+        self.flash(msg, 10)
+        self.notify("Otomatik temizlik", msg)
+        self.log_event("temizlik", msg)
+
+    def prune_history(self, days=None, done=None):
+        h = self.history
+        if h is None or self.prune_busy:
+            return
+        self.prune_busy = True
+        days = days or self.pref("log_days")
+
+        def work():
+            try:
+                n = h.prune(days)
+            except sqlite3.Error:
+                n = -1
+            GLib.idle_add(self.on_pruned, n, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_pruned(self, n, done):
+        self.prune_busy = False
+        if done:
+            done(n)
+        return False
+
+    def build_server_shutdown(self):
+        self.flash("dotnet build-server shutdown çalışıyor…")
+
+        def work():
+            try:
+                res = subprocess.run(["dotnet", "build-server", "shutdown"], capture_output=True, text=True,
+                                     timeout=60)
+                msg = ("dotnet derleme sunucuları kapatıldı." if res.returncode == 0
+                       else "dotnet hata verdi: " + (res.stderr.strip().splitlines() or ["?"])[-1])
+            except FileNotFoundError:
+                msg = "dotnet bulunamadı."
+            except subprocess.TimeoutExpired:
+                msg = "dotnet build-server shutdown zaman aşımına uğradı."
+            GLib.idle_add(self.flash_idle, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def flash_idle(self, msg):
+        self.flash(msg, 10)
+        return False
+
+    # -------------------------------------------------------------- yetkili okuma (pkexec)
+    def make_priv_toggle(self, label):
+        chk = Gtk.CheckButton(label=label)
+        chk.set_tooltip_text("pkexec ile salt-okunur bir yardımcı başlatır: tüm kullanıcıların süreçleri için "
+                             "port, PSS, disk G/Ç ve dosya sahibi bilgisi. Her açılışta parola sorar; "
+                             "sonlandırma işlemleri yine normal kullanıcı olarak yapılır.")
+        chk.set_active(self.priv_helper is not None or self.priv_starting)
+        chk.connect("toggled", self.on_priv_toggled)
+        chk.connect("destroy", lambda w: w in self.priv_toggles and self.priv_toggles.remove(w))
+        self.priv_toggles.append(chk)
+        return chk
+
+    def sync_priv(self, on):
+        self._priv_sync = True
+        for w in self.priv_toggles:
+            w.set_active(on)
+        self._priv_sync = False
+
+    def on_priv_toggled(self, chk):
+        if self._priv_sync:
+            return
+        on = chk.get_active()
+        self.sync_priv(on)
+        self.set_privileged(on)
+
+    def set_privileged(self, on):
+        if on:
+            if self.priv_helper is not None or self.priv_starting:
+                return
+            self.priv_starting = True
+            helper = PrivHelper()
+            self.flash("Yetki isteniyor… (parola penceresi)", 30)
+
+            def work():
+                try:
+                    helper.start()
+                    err = None
+                except HelperError as e:
+                    helper.stop()
+                    err = str(e)
+                GLib.idle_add(self.on_priv_started, helper, err)
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            helper, self.priv_helper = self.priv_helper, None
+            self.stats.helper = None
+            if helper is not None:
+                threading.Thread(target=helper.stop, daemon=True).start()
+            self.sync_priv(False)
+            self.stats.wake.set()
+
+    def on_priv_started(self, helper, err):
+        self.priv_starting = False
+        if err or self.quitting:
+            helper.stop()
+            self.sync_priv(False)
+            self.flash(f"Yetkili okuma açılamadı: {err}" if err else "", 10)
+            return False
+        self.priv_helper = helper
+        self.stats.error = None
+        self.stats.helper = helper
+        self.stats.wake.set()
+        self.sync_priv(True)
+        self.flash("Yetkili okuma açık: tüm kullanıcıların süreçleri okunuyor.", 8)
+        return False
+
+    def check_helper(self):
+        err = self.stats.error
+        if not err:
+            return
+        self.stats.error = None
+        if self.priv_helper is not None:
+            self.priv_helper = None
+            self.sync_priv(False)
+            self.flash(f"Yetkili okuma kapandı: {err}", 10)
+
+    # -------------------------------------------------------------- kapanis
+    def set_hidden(self, hidden):
+        self.hidden = hidden
+        self.stats.interval = 10.0 if hidden else 3.0
+        self.stats.wake.set()
+        if not hidden:
+            self.refresh_processes()
+
+    def quit_app(self):
+        self.quitting = True
+        self.save_settings(self.win)
+        if self.app is not None:
+            self.app.quit()
+
+    def close(self):
+        helper, self.priv_helper = self.priv_helper, None
+        self.stats.helper = None
+        if helper is not None:
+            helper.stop()
+        if self.history is not None:
+            h, self.history, self.recorder = self.history, None, None
+            try:
+                h.close()
+            except sqlite3.Error:
+                pass
 
     # -------------------------------------------------------------- ayarlari kaydet / yukle
     def restore_view(self):
         page = self.settings.get("tab")
-        if isinstance(page, int) and 0 <= page <= TAB_CLEAN:
-            self.root.set_current_page(page)
+        if isinstance(page, int):
+            if self.settings.get("version", 1) < 2:  # eski dosya: Gecmis/Servisler sekmeleri yoktu
+                page = OLD_TABS[page] if 0 <= page < len(OLD_TABS) else None
+            if page is not None and 0 <= page <= TAB_SERVICES:
+                self.root.set_current_page(page)
         perf = self.settings.get("perf_page")
         if perf and self.stack.get_child_by_name(perf):
             self.stack.set_visible_child_name(perf)
 
     def save_settings(self, win=None):
         data = {
-            "version": 1,
+            "version": 2,
             "tab": self.root.get_current_page(),
             "perf_page": self.stack.get_visible_child_name(),
             "tree_mode": self.tree_mode,
@@ -2711,36 +3732,74 @@ class TaskManager:
             "ports_sort": self.ncols.sort_to_list(self.nsort),
             "clean_columns": self.ccols.to_dict(),
             "clean_sort": self.ccols.sort_to_list(self.csort),
+            "services_columns": self.scols.to_dict(),
+            "services_sort": self.scols.sort_to_list(self.ssort),
             "clean_roots": self.clean_roots,
+            "hist_range": self.hist_range.get_active(),
+            "bg_hint": bool(self.settings.get("bg_hint")),
         }
+        for key in PREFS:
+            data[key] = self.pref(key)
         if win is not None:
             data["window"] = list(win.get_size())
+        elif self.settings.get("window") is not None:
+            data["window"] = self.settings["window"]
         write_settings(data)
 
 
 class App(Gtk.Application):
-    def __init__(self, app_id=APP_ID):
+    def __init__(self, app_id=APP_ID, background=False):
         super().__init__(application_id=app_id)
         self.tm = None
+        self.background = background
 
     def do_activate(self):
-        win = self.props.active_window
-        if win is None:
-            tm = self.tm = TaskManager()
-            win = Gtk.ApplicationWindow(application=self, title="Görev Yöneticisi")
-            size = tm.settings.get("window")
-            if isinstance(size, list) and len(size) == 2 and all(isinstance(v, int) and v > 200 for v in size):
-                win.set_default_size(*size)
-            else:
-                win.set_default_size(1180, 720)
-            win.set_icon_name("utilities-system-monitor")
-            win.add(tm.root)
-            tm.win = win
-            win.connect("key-press-event", tm.on_key)
-            win.connect("delete-event", lambda w, _e: tm.save_settings(w) or False)
-            win.show_all()
-            tm.restore_view()
-        win.present()
+        wins = self.get_windows()
+        if wins:  # ikinci "tskmngr" ya da bildirim tiklamasi: gizli pencereyi geri getir
+            self.tm.set_hidden(False)
+            wins[0].present()
+            return
+        self.hold()  # pencere gizlenince de calismaya (gecmis kaydina) devam et
+        tm = self.tm = TaskManager()
+        tm.app = self
+        win = Gtk.ApplicationWindow(application=self, title="Görev Yöneticisi")
+        size = tm.settings.get("window")
+        if isinstance(size, list) and len(size) == 2 and all(isinstance(v, int) and v > 200 for v in size):
+            win.set_default_size(*size)
+        else:
+            win.set_default_size(1180, 720)
+        win.set_icon_name("utilities-system-monitor")
+        win.add(tm.root)
+        tm.win = win
+        win.connect("key-press-event", tm.on_key)
+        win.connect("delete-event", self.on_delete)
+        tm.root.show_all()
+        tm.restore_view()
+        if self.background:
+            tm.set_hidden(True)
+        else:
+            win.show()
+            win.present()
+
+    def on_delete(self, win, _ev):
+        tm = self.tm
+        tm.save_settings(win)
+        if tm.pref("bg_run") and not tm.quitting:
+            win.hide()
+            tm.set_hidden(True)
+            if not tm.settings.get("bg_hint"):
+                tm.set_pref("bg_hint", True)
+                tm.notify("Arka planda çalışıyor",
+                          "Pencere kapandı ama geçmiş kaydı sürüyor. Tamamen kapatmak için Ctrl+Q "
+                          "ya da Ayarlar → Tamamen çık. Açmak için tskmngr'yi tekrar çalıştır.")
+        else:
+            tm.quit_app()
+        return True
+
+    def do_shutdown(self):
+        if self.tm is not None:
+            self.tm.close()
+        Gtk.Application.do_shutdown(self)
 
 
 def spin(seconds):
@@ -2766,7 +3825,8 @@ def screenshots(outdir):
     win.show_all()
     spin(3.2)
     for name, tab, page in (("proc", TAB_PROCESSES, None), ("cpu", TAB_PERFORMANCE, "cpu"),
-                            ("docker", TAB_DOCKER, None)):
+                            ("psi", TAB_PERFORMANCE, "psi"), ("history", TAB_HISTORY, None),
+                            ("services", TAB_SERVICES, None), ("docker", TAB_DOCKER, None)):
         tm.root.set_current_page(tab)
         if page:
             tm.stack.set_visible_child_name(page)
@@ -2783,7 +3843,8 @@ def selfshot(outdir, steps=None):
     app.activate()
     win, tm = app.props.active_window, app.tm
     spin(3.0)
-    steps = steps or ["proc", "tree", "docker", "ports", "projects", "portstab", "clean"]
+    steps = steps or ["proc", "tree", "docker", "ports", "projects", "portstab", "clean", "history", "services",
+                      "psi"]
     for name in steps:
         if name == "proc":
             tm.root.set_current_page(TAB_PROCESSES)
@@ -2806,6 +3867,17 @@ def selfshot(outdir, steps=None):
         elif name == "projects":
             tm.search.set_text("")
             tm.root.set_current_page(TAB_PROJECTS)
+            spin(2.0)
+        elif name == "history":
+            tm.root.set_current_page(TAB_HISTORY)
+            spin(1.5)
+        elif name == "services":
+            tm.root.set_current_page(TAB_SERVICES)
+            spin(2.5)
+        elif name == "psi":
+            tm.root.set_current_page(TAB_PERFORMANCE)
+            tm.stack.set_visible_child_name("psi")
+            spin(2.5)
         elif name == "ports":
             tm.root.set_current_page(TAB_PROCESSES)
             tm.search.set_text(":3306")
@@ -2824,4 +3896,9 @@ if __name__ == "__main__":
     elif len(sys.argv) > 2 and sys.argv[1] == "--screenshots":
         screenshots(sys.argv[2])
     else:
-        sys.exit(App().run(sys.argv[:1]))
+        bg = "--background" in sys.argv[1:]
+        app = App(background=bg)
+        app.register()
+        if bg and app.get_is_remote():  # zaten calisiyor: oturum acilisinda pencereyi one cikarma
+            sys.exit(0)
+        sys.exit(app.run(sys.argv[:1]))
