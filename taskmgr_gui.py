@@ -3323,6 +3323,7 @@ class TaskManager:
         self.update_history_info()
 
     def build_language_row(self, box, widgets, note):
+        """Dil seciminde ayar kaydedilir ve uygulama kendini yeniden baslatir (dil yalnizca acilista okunur)."""
         started = self.settings.get("language", "auto")
         started = started if started in tm_i18n.CODES else "auto"
         combo = Gtk.ComboBoxText()
@@ -3331,22 +3332,15 @@ class TaskManager:
         combo.set_active_id(started)
         combo.set_halign(Gtk.Align.START)
         box.pack_start(combo, False, False, 0)
-        row = Gtk.Box(spacing=8, no_show_all=True)
-        row.pack_start(Gtk.Label(label=_("Dil değişikliği yeniden başlatınca uygulanır."), xalign=0), False, False, 0)
-        btn = Gtk.Button(label=_("Şimdi yeniden başlat"))
-        btn.connect("clicked", lambda _b: self.restart_app())
-        row.pack_start(btn, False, False, 0)
-        box.pack_start(row, False, False, 0)
 
         def changed(c):
             code = c.get_active_id() or "auto"
             self.set_pref("language", code)
-            row.set_visible(code != started)
             if code != started:
-                row.show_all()
+                self.flash(_("Dil değiştiriliyor, uygulama yeniden başlıyor…"), 10)
+                GLib.timeout_add(250, self.restart_app)
         combo.connect("changed", changed)
         widgets["language"] = combo
-        widgets["language_restart"] = row
 
     def build_profile_checks(self, box, widgets):
         def toggled(_chk):
@@ -4121,15 +4115,19 @@ class TaskManager:
         return False
 
     def restart_app(self):
-        """Dil gibi yalnizca acilista okunan ayarlar icin: bu surec kapaninca yenisi baslar (kisa gecikmeyle)."""
+        """Dil gibi yalnizca acilista okunan ayarlar icin: bu surec kapaninca yenisi baslar."""
         args = [a for a in sys.argv[1:] if a != "--background"]
         try:
-            subprocess.Popen(["sh", "-c", 'sleep 1; exec "$@"', "sh", sys.executable, os.path.realpath(__file__), *args],
+            # yeni surec, bu surec tamamen cikana (en cok ~10 sn) kadar bekler; yoksa tek-ornek (GApplication) kurali
+            # onu hala acik olan eski surece devredip kapanmasina yol acar
+            wait = 'i=0; while kill -0 "$0" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done; exec "$@"'
+            subprocess.Popen(["sh", "-c", wait, str(os.getpid()), sys.executable, os.path.realpath(__file__), *args],
                              start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             self.flash(_("Yeniden başlatılamadı: {err}").format(err=e), 10)
-            return
+            return False
         self.quit_app()
+        return False  # GLib.timeout_add geri cagrisi olarak da kullanilir
 
     def quit_app(self):
         self.quitting = True

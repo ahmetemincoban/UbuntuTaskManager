@@ -55,8 +55,8 @@ Sağ üstteki **⚙ Ayarlar** (Ctrl+,) penceresi; her değişiklik hemen `~/.con
 
 Arayüz **Türkçe, English, Deutsch ve Français** olarak kullanılabilir. Varsayılan "Sistem dili"dir (`LANGUAGE` / `LC_ALL` /
 `LANG`); desteklenmeyen bir dilde İngilizce açılır. **⚙ Ayarlar → Dil / Language** ya da `settings.json` içindeki
-`"language"` (`auto`, `tr`, `en`, `de`, `fr`) ile değişir; değişiklik uygulama yeniden başlayınca geçerli olur ("Şimdi
-yeniden başlat" düğmesi vardır). Kaynak metinler Türkçedir; çeviriler `tm_lang.py` içindeki katalogdadır
+`"language"` (`auto`, `tr`, `en`, `de`, `fr`) ile değişir; seçim yapılınca uygulama kendini otomatik yeniden
+başlatır (dil yalnızca açılışta okunur). Kaynak metinler Türkçedir; çeviriler `tm_lang.py` içindeki katalogdadır
 (`Türkçe metin -> (en, de, fr)`), katalogda olmayan metin Türkçe kalır. Yeni bir metin eklerken kodda `_("...")` kullanıp
 kataloğa üç çeviriyi eklemek yeter; `tests/test_i18n.py` eksik çeviriyi ve bozuk `{yer tutucu}`'ları yakalar.
 

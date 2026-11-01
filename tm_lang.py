@@ -627,7 +627,6 @@ CATALOG = {
         "Lecture privilégiée (root, lecture seule)",
     ),
     "Tamamen çık": ("Quit completely", "Vollständig beenden", "Quitter complètement"),
-    "Şimdi yeniden başlat": ("Restart now", "Jetzt neu starten", "Redémarrer maintenant"),
     "Bu işlem geri alınamaz.": (
         "This cannot be undone.",
         "Dies kann nicht rückgängig gemacht werden.",
@@ -924,12 +923,12 @@ CATALOG = {
         "docker {what} prune läuft…",
         "docker {what} prune en cours…",
     ),
-    "Sistem dili": ("System language", "Systemsprache", "Langue du système"),
-    "Dil değişikliği yeniden başlatınca uygulanır.": (
-        "The language change takes effect after a restart.",
-        "Die Sprachänderung wird nach einem Neustart wirksam.",
-        "Le changement de langue prend effet après un redémarrage.",
+    "Dil değiştiriliyor, uygulama yeniden başlıyor…": (
+        "Changing language, the app is restarting…",
+        "Sprache wird geändert, die Anwendung startet neu…",
+        "Changement de langue, l'application redémarre…",
     ),
+    "Sistem dili": ("System language", "Systemsprache", "Langue du système"),
     "Tüm geçmiş silinsin mi?": ("Delete all history?", "Gesamten Verlauf löschen?", "Supprimer tout l'historique ?"),
     "Kaydedilmiş bütün kayıtlar silinir.": (
         "All saved records will be deleted.",

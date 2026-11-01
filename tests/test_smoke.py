@@ -23,6 +23,22 @@ tm.root.set_current_page(m.TAB_PERFORMANCE)
 tm.stack.set_visible_child_name("psi"); m.spin(1.5)
 tm.open_settings(); m.spin(1)
 print(tm.hist_info_label.get_text())
+
+def find_combo(w):
+    if isinstance(w, Gtk.ComboBoxText) and w.get_active_id() in ("auto", "tr", "en", "de", "fr"):
+        return w
+    for c in (w.get_children() if isinstance(w, Gtk.Container) else []):
+        r = find_combo(c)
+        if r:
+            return r
+
+restarts = []
+tm.restart_app = lambda: restarts.append(1) and False  # gercekten yeniden baslatma
+lang_combo = find_combo(tm.settings_win)
+assert lang_combo is not None, "dil kutusu bulunamadi"
+lang_combo.set_active_id("fr"); m.spin(0.8)
+assert restarts == [1], "dil secilince uygulama kendini yeniden baslatmali"
+assert m.load_settings().get("language") == "fr"
 tm.settings_win.destroy(); m.spin(0.3)
 tm.save_settings(); print("saved")
 tm.set_pref("language", "de")  # dil secimi diske yazilmali (PREFS disinda oldugu icin bir kez kayboluyordu)
