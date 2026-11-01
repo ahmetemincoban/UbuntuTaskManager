@@ -51,6 +51,15 @@ Sağ üstteki **⚙ Ayarlar** (Ctrl+,) penceresi; her değişiklik hemen `~/.con
   MSBuild node, VBCSCompiler, Gradle daemon…) belirlenen süreden sonra kapatılır. Seçili profillerin derleme sunucusu
   kapatma komutları (`dotnet build-server shutdown`, `gradle --stop`) düğme olarak gelir.
 
+## Dil
+
+Arayüz **Türkçe, English, Deutsch ve Français** olarak kullanılabilir. Varsayılan "Sistem dili"dir (`LANGUAGE` / `LC_ALL` /
+`LANG`); desteklenmeyen bir dilde İngilizce açılır. **⚙ Ayarlar → Dil / Language** ya da `settings.json` içindeki
+`"language"` (`auto`, `tr`, `en`, `de`, `fr`) ile değişir; değişiklik uygulama yeniden başlayınca geçerli olur ("Şimdi
+yeniden başlat" düğmesi vardır). Kaynak metinler Türkçedir; çeviriler `tm_lang.py` içindeki katalogdadır
+(`Türkçe metin -> (en, de, fr)`), katalogda olmayan metin Türkçe kalır. Yeni bir metin eklerken kodda `_("...")` kullanıp
+kataloğa üç çeviriyi eklemek yeter; `tests/test_i18n.py` eksik çeviriyi ve bozuk `{yer tutucu}`'ları yakalar.
+
 ## Profiller
 
 **Ayarlar → Profil** bölümünden çalıştığın teknolojileri işaretle (birden fazla seçilebilir; ilk açılışta sorulur,

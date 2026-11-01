@@ -20,6 +20,10 @@ atexit.register(shutil.rmtree, SCR, True)
 sys.path.insert(0, ROOT)
 sys.argv = ["tskmngr-test"]
 
+import tm_i18n  # noqa: E402
+
+tm_i18n.set_language(os.environ.get("TSK_TEST_LANG", "tr"))  # sistem dili testleri etkilemesin
+
 
 def load_app():
     spec = importlib.util.spec_from_file_location("tg", os.path.join(ROOT, "taskmgr_gui.py"))

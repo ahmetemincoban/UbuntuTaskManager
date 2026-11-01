@@ -17,6 +17,12 @@ try:
 except ImportError:  # root ortaminda yoksa soket okuma devre disi kalir
     psutil = None
 
+try:
+    from tm_i18n import _
+except ImportError:  # root yardimcisi (python3 -I -c) kardes modulleri goremez; orada metin cevrilmez
+    def _(text):
+        return text
+
 
 # ---------------------------------------------------------------- okuma islevleri (root tarafi da kullanir)
 def read_stats():
@@ -188,7 +194,7 @@ class PrivHelper:
             self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.DEVNULL, text=True, bufsize=1)
         except OSError as e:
-            raise HelperError(f"başlatılamadı: {e}")
+            raise HelperError(_("başlatılamadı: {e}").format(e=e))
         uid = self.request("ping", timeout=180)
         return uid
 
@@ -196,7 +202,7 @@ class PrivHelper:
         with self.lock:
             proc = self.proc
             if proc is None or proc.poll() is not None:
-                raise HelperError("yardımcı çalışmıyor (parola penceresi iptal edilmiş olabilir)")
+                raise HelperError(_("yardımcı çalışmıyor (parola penceresi iptal edilmiş olabilir)"))
             self.seq += 1
             msg = dict(args, op=op, id=self.seq)
             try:
@@ -205,14 +211,14 @@ class PrivHelper:
                 ready, _w, _x = select.select([proc.stdout], [], [], timeout)
                 if not ready:
                     self.stop()
-                    raise HelperError("yardımcı cevap vermedi")
+                    raise HelperError(_("yardımcı cevap vermedi"))
                 line = proc.stdout.readline()
             except (OSError, ValueError):
                 self.stop()
-                raise HelperError("yardımcıyla bağlantı koptu")
+                raise HelperError(_("yardımcıyla bağlantı koptu"))
             if not line:
                 self.stop()
-                raise HelperError("yardımcı kapandı (parola iptal edildi ya da yetki verilmedi)")
+                raise HelperError(_("yardımcı kapandı (parola iptal edildi ya da yetki verilmedi)"))
             reply = json.loads(line)
             if not reply.get("ok"):
                 raise HelperError(reply.get("error") or "hata")

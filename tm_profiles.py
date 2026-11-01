@@ -8,13 +8,15 @@ import json
 import os
 import re
 
+from tm_i18n import _
+
 # clean kurali: (klasor adi, dosya isaretleri, tur etiketi, yalniz_gitignore)
 #   isaretler: ayni dizinde bulunmasi gereken dosya adi ya da uzanti ('.csproj'); () = isaret aranmaz
 #   yalniz_gitignore: 'build', 'dist' gibi genel adlar yalnizca git tarafindan yok sayiliyorsa silinebilir
 BUILTIN = {
     "dotnet": dict(
         name=".NET",
-        desc="dotnet, MSBuild, VBCSCompiler, testhost; bin/obj klasörleri",
+        desc=_("dotnet, MSBuild, VBCSCompiler, testhost; bin/obj klasörleri"),
         proc=r"dotnet|MSBuild|VBCSCompiler|testhost|OmniSharp|Microsoft\.CodeAnalysis",
         idle=[("MSBuild node", r"MSBuild\.dll.*nodeReuse:true"), ("VBCSCompiler", r"VBCSCompiler")],
         clean=[("bin", (".csproj", ".fsproj", ".vbproj"), ".NET bin", False),
@@ -28,7 +30,7 @@ BUILTIN = {
         idle=[("esbuild", r"esbuild.*--(service|ping)"), ("jest worker", r"jest-worker"),
               ("Nx daemon", r"nx/src/daemon")],
         clean=[("node_modules", ("package.json",), "node_modules", False),
-               (".angular", ("angular.json",), "Angular önbelleği", False),
+               (".angular", ("angular.json",), _("Angular önbelleği"), False),
                ("dist", ("angular.json",), "Angular dist", True)],
     ),
     "react": dict(
@@ -37,8 +39,8 @@ BUILTIN = {
         proc=r"(^|/)(node|npm|npx|pnpm|yarn|esbuild|vite|next)( |$)|webpack|tsserver|typingsInstaller|jest",
         idle=[("esbuild", r"esbuild.*--(service|ping)"), ("jest worker", r"jest-worker")],
         clean=[("node_modules", ("package.json",), "node_modules", False),
-               (".next", ("package.json",), "Next.js önbelleği", False),
-               (".parcel-cache", ("package.json",), "Parcel önbelleği", False),
+               (".next", ("package.json",), _("Next.js önbelleği"), False),
+               (".parcel-cache", ("package.json",), _("Parcel önbelleği"), False),
                ("build", ("package.json",), "React build", True),
                ("dist", ("package.json",), "dist", True)],
     ),
@@ -48,8 +50,8 @@ BUILTIN = {
         proc=r"(^|/)(node|npm|npx|pnpm|yarn|esbuild|vite|nuxt)( |$)|tsserver|typingsInstaller|vitest",
         idle=[("esbuild", r"esbuild.*--(service|ping)")],
         clean=[("node_modules", ("package.json",), "node_modules", False),
-               (".nuxt", ("package.json",), "Nuxt önbelleği", False),
-               (".output", ("package.json",), "Nuxt çıktısı", False),
+               (".nuxt", ("package.json",), _("Nuxt önbelleği"), False),
+               (".output", ("package.json",), _("Nuxt çıktısı"), False),
                ("dist", ("package.json",), "dist", True)],
     ),
     "java": dict(
@@ -59,7 +61,7 @@ BUILTIN = {
         idle=[("Gradle daemon", r"GradleDaemon"), ("Kotlin daemon", r"KotlinCompileDaemon")],
         clean=[("target", ("pom.xml",), "Maven target", False),
                ("build", ("build.gradle", "build.gradle.kts"), "Gradle build", True),
-               (".gradle", ("build.gradle", "build.gradle.kts"), "Gradle önbelleği", False)],
+               (".gradle", ("build.gradle", "build.gradle.kts"), _("Gradle önbelleği"), False)],
         shutdown=["gradle", "--stop"],
     ),
     "python": dict(
@@ -68,9 +70,9 @@ BUILTIN = {
         proc=r"(^|/)python[0-9.]*( |$)|pytest|uvicorn|gunicorn|celery|jupyter",
         idle=[],
         clean=[("__pycache__", (), "__pycache__", False),
-               (".pytest_cache", (), "pytest önbelleği", False),
-               (".mypy_cache", (), "mypy önbelleği", False),
-               (".ruff_cache", (), "ruff önbelleği", False)],
+               (".pytest_cache", (), _("pytest önbelleği"), False),
+               (".mypy_cache", (), _("mypy önbelleği"), False),
+               (".ruff_cache", (), _("ruff önbelleği"), False)],
     ),
     "rust": dict(
         name="Rust",
@@ -101,7 +103,7 @@ def _clean_custom(pid, raw):
     """Kullanici profilini dogrular; gecersizse None."""
     if not isinstance(raw, dict) or not isinstance(raw.get("name"), str) or not raw["name"].strip():
         return None
-    out = dict(name=raw["name"].strip(), desc=str(raw.get("desc", "özel profil")), proc=r"(?!x)x", idle=[],
+    out = dict(name=raw["name"].strip(), desc=str(raw.get("desc", _("özel profil"))), proc=r"(?!x)x", idle=[],
                clean=[], shutdown=None, custom=True)
     if isinstance(raw.get("proc"), str) and _valid_rx(raw["proc"]):
         out["proc"] = raw["proc"]

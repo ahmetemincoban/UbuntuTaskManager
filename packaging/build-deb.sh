@@ -28,7 +28,13 @@ cat > "$root/usr/share/applications/tr.teginsoft.TaskMgr.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Görev Yöneticisi
+Name[en]=Task Manager
+Name[de]=Task-Manager
+Name[fr]=Gestionnaire de tâches
 Comment=Süreçleri, CPU/RAM/Disk/Ağ kullanımını izle ve sonlandır
+Comment[en]=Monitor and end processes, track CPU/RAM/disk/network usage
+Comment[de]=Prozesse überwachen und beenden, CPU-/RAM-/Datenträger-/Netzwerkauslastung verfolgen
+Comment[fr]=Surveiller et terminer les processus, suivre l'utilisation CPU/RAM/disque/réseau
 Exec=tskmngr
 Icon=utilities-system-monitor
 Terminal=false

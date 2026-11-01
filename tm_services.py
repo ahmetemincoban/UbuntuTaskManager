@@ -4,6 +4,8 @@ import glob
 import os
 import subprocess
 
+from tm_i18n import _
+
 AUTOSTART_USER = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
                               "autostart")
 AUTOSTART_SYSTEM = "/etc/xdg/autostart"
@@ -62,7 +64,7 @@ def list_user_services():
 def service_action(unit, verb):
     """-> hata metni | None"""
     if verb not in SERVICE_VERBS or not unit.endswith(".service"):
-        return "geçersiz işlem"
+        return _("geçersiz işlem")
     _out, err = _run(["systemctl", "--user", verb, unit], timeout=30)
     return err
 
@@ -100,7 +102,7 @@ def list_autostart():
 def set_autostart(fname, enabled):
     """Kullanici klasorunde bir override yazar (sistem dosyasina dokunmaz). -> hata metni | None"""
     if os.sep in fname or not fname.endswith(".desktop"):
-        return "geçersiz dosya adı"
+        return _("geçersiz dosya adı")
     user_path = os.path.join(AUTOSTART_USER, fname)
     src = user_path if os.path.exists(user_path) else os.path.join(AUTOSTART_SYSTEM, fname)
     try:
