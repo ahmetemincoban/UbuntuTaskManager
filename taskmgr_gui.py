@@ -4190,6 +4190,8 @@ class TaskManager:
         }
         for key in PREFS:
             data[key] = self.pref(key)
+        lang = self.settings.get("language", "auto")
+        data["language"] = lang if lang in tm_i18n.CODES else "auto"
         if win is not None:
             data["window"] = list(win.get_size())
         elif self.settings.get("window") is not None:

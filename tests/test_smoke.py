@@ -25,4 +25,10 @@ tm.open_settings(); m.spin(1)
 print(tm.hist_info_label.get_text())
 tm.settings_win.destroy(); m.spin(0.3)
 tm.save_settings(); print("saved")
+tm.set_pref("language", "de")  # dil secimi diske yazilmali (PREFS disinda oldugu icin bir kez kayboluyordu)
+assert m.load_settings().get("language") == "de"
+tm.save_settings()
+assert m.load_settings().get("language") == "de", "baska bir kayit dil secimini silmemeli"
+tm.set_pref("language", "gecersiz")
+assert m.load_settings().get("language") == "auto"
 tm.history.flush(); print("span", tm.history.span())
