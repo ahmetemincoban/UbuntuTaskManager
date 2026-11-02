@@ -17,6 +17,7 @@ install -d "$root/DEBIAN" "$root/usr/lib/$pkg" "$root/usr/bin" "$root/usr/share/
 install -m 644 "$here"/taskmgr_gui.py "$here"/tm_*.py "$root/usr/lib/$pkg/"
 chmod 755 "$root/usr/lib/$pkg/taskmgr_gui.py"
 install -m 644 "$here/README.md" "$root/usr/share/doc/$pkg/README.md"
+install -m 644 "$here/README.tr.md" "$root/usr/share/doc/$pkg/README.tr.md"
 install -m 644 "$here/LICENSE" "$root/usr/share/doc/$pkg/copyright"
 
 cat > "$root/usr/bin/tskmngr" <<'LAUNCHER'
