@@ -163,3 +163,7 @@ python3 tests/test_profiles.py      # tek dosya
 Testler ekranı olan bir oturumda çalışır (pencereler ekran dışında oluşturulur) ve kullanıcının ayarlarına /
 geçmişine dokunmaz: `XDG_CONFIG_HOME` ve `XDG_DATA_HOME` geçici klasöre yönlendirilir. Otomatik bir CI'a
 bağlı değildir; elle çalıştırılır.
+
+## Lisans
+
+[MIT](LICENSE) © 2026 Teginsoft
