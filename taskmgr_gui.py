@@ -43,7 +43,7 @@ from tm_i18n import _  # noqa: E402
 from tm_history import DEFAULT_DAYS, SYS_EVERY, History, Recorder, psi_some10, read_psi  # noqa: E402
 from tm_procfs import HelperError, PrivHelper, find_owners, listening_sockets, read_stats  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_ID = "tr.teginsoft.TaskMgr"
 NCPU = psutil.cpu_count() or 1
 ME = os.getuid()
