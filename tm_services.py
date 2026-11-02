@@ -144,6 +144,18 @@ def _missing(done, enabled):
     return [f"{k}={_value(k, enabled)}" for k in ("Hidden", "X-GNOME-Autostart-enabled") if k not in done]
 
 
+def desktop_exec(*argv):
+    """Exec= satiri icin bosluk/ozel karakter iceren argumanlari tirnaklar (Desktop Entry spec: \\ ve % kacisli)."""
+    out = []
+    for a in argv:
+        if a and not any(c in a for c in ' \t\n"\'\\><~|&;$*?#()`%'):
+            out.append(a)
+            continue
+        esc = a.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
+        out.append(f'"{esc}"')
+    return " ".join(out)
+
+
 def write_self_autostart(exec_line, enabled):
     """tskmngr'nin kendi arka plan baslatma dosyasini yazar / siler. -> hata metni | None"""
     path = os.path.join(AUTOSTART_USER, "tr.teginsoft.TaskMgr.desktop")

@@ -219,9 +219,13 @@ class PrivHelper:
             if not line:
                 self.stop()
                 raise HelperError(_("yardımcı kapandı (parola iptal edildi ya da yetki verilmedi)"))
-            reply = json.loads(line)
-            if not reply.get("ok"):
-                raise HelperError(reply.get("error") or "hata")
+            try:
+                reply = json.loads(line)
+            except ValueError:
+                self.stop()
+                raise HelperError(_("yardımcıdan geçersiz cevap geldi"))
+            if not isinstance(reply, dict) or not reply.get("ok"):
+                raise HelperError((reply.get("error") if isinstance(reply, dict) else None) or "hata")
             return reply["result"]
 
     def stop(self):

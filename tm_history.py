@@ -65,11 +65,15 @@ class History:
 
     # ---- baglanti
     def _open(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
         for attempt in (0, 1):
             try:
                 fresh = not os.path.exists(self.path)
                 conn = sqlite3.connect(self.path, check_same_thread=False)
+                try:
+                    os.chmod(self.path, 0o600)  # surec adlari/proje yollari iceriyor: yalniz sahibi okusun
+                except OSError:
+                    pass
                 if fresh:
                     conn.execute("PRAGMA auto_vacuum=INCREMENTAL")  # tablolardan once ayarlanmali
                 conn.execute("PRAGMA synchronous=OFF")

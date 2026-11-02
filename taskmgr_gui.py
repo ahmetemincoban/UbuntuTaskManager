@@ -138,9 +138,9 @@ def load_settings():
 def write_settings(data):
     path = settings_path()
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except OSError as e:
@@ -339,7 +339,7 @@ def project_root(cwd):
 def git_status(root):
     """-> (dal metni, degisen dosya sayisi); git deposu degilse ('', -1)"""
     try:
-        res = subprocess.run(["git", "--no-optional-locks", "-C", root, "status", "--porcelain=v1", "-b"],
+        res = subprocess.run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", root, "status", "--porcelain=v1", "-b"],
                              capture_output=True, text=True, timeout=15, errors="replace")
     except (OSError, subprocess.TimeoutExpired):
         return "", -1
@@ -372,7 +372,7 @@ def tracked_dirs(paths):
             chunk = group[i:i + 100]
             rels = [os.path.relpath(p, root) for p in chunk]
             try:
-                res = subprocess.run(["git", "-C", root, "ls-files", "-z", "--", *[":(literal)" + r for r in rels]],
+                res = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", root, "ls-files", "-z", "--", *[":(literal)" + r for r in rels]],
                                      capture_output=True, timeout=30)
             except (OSError, subprocess.TimeoutExpired):
                 hit.update(chunk)
@@ -518,7 +518,7 @@ def docker_port_map():
 def git_ignored(path):
     """path git tarafindan yok sayiliyor mu? (git deposu degilse False)"""
     try:
-        res = subprocess.run(["git", "-C", os.path.dirname(path), "check-ignore", "-q", "--", os.path.basename(path)],
+        res = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", os.path.dirname(path), "check-ignore", "-q", "--", os.path.basename(path)],
                              capture_output=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1383,7 +1383,7 @@ class TaskManager:
         except (GLib.Error, TypeError):
             pass
         try:
-            subprocess.Popen(["notify-send", "-a", _("Görev Yöneticisi"), title, body],
+            subprocess.Popen(["notify-send", "-a", _("Görev Yöneticisi"), "--", title, body],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
@@ -3379,7 +3379,8 @@ class TaskManager:
 
     def on_self_autostart(self, chk):
         path = os.path.realpath(__file__)
-        err = tm_services.write_self_autostart(f'{sys.executable} "{path}" --background', chk.get_active())
+        err = tm_services.write_self_autostart(tm_services.desktop_exec(sys.executable, path, "--background"),
+                                               chk.get_active())
         if err:
             self.flash(_("Oturum açılışı ayarı yazılamadı: {err}").format(err=err), 10)
 

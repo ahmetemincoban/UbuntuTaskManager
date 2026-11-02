@@ -1243,6 +1243,11 @@ CATALOG = {
         "Hilfsprogramm läuft nicht (der Passwortdialog wurde evtl. abgebrochen)",
         "l'assistant ne fonctionne pas (la fenêtre de mot de passe a peut-être été annulée)",
     ),
+    "yardımcıdan geçersiz cevap geldi": (
+        "invalid reply from the helper",
+        "Ungültige Antwort vom Hilfsprogramm",
+        "réponse invalide de l'assistant",
+    ),
     "yardımcı kapandı (parola iptal edildi ya da yetki verilmedi)": (
         "helper exited (password cancelled or authorization not granted)",
         "Hilfsprogramm beendet (Passwort abgebrochen oder Berechtigung nicht erteilt)",
