@@ -52,4 +52,12 @@ except tp.HelperError:
     pass
 assert not helper.alive
 
+# gercek notify(): dugmeli (hedefli) bildirim kurulabilmeli (testler notify'i taklit ettigi icin bu hata gozden kacmisti)
+from gi.repository import Gio, GLib  # noqa: E402
+
+gapp = Gio.Application(application_id="tr.teginsoft.TaskMgrTest")
+gapp.register(None)
+gapp.set_default()
+m.TaskManager.notify(None, "t", "b", [("Sonlandir", "app.kill", GLib.Variant("(ix)", (1, 2))), ("Ac", "app.open", None)])
+
 print("OK")

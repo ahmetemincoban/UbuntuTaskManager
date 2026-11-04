@@ -1377,7 +1377,7 @@ class TaskManager:
                     if target is None:
                         n.add_button(label, action)
                     else:
-                        n.add_button_with_target_value(label, action, target)
+                        n.add_button_with_target(label, action, target)
                 app.send_notification(None, n)
                 return
         except (GLib.Error, TypeError):
