@@ -134,7 +134,7 @@ Sistem `python3`, `python3-gi` (GTK 3), `python3-psutil`. Docker sekmesi için `
 
 ```bash
 packaging/build-deb.sh                          # dist/tskmngr_<surum>_all.deb üretir
-sudo apt install ./dist/tskmngr_1.2.0_all.deb   # bağımlılıkları da kurar
+sudo apt install ./dist/tskmngr_1.2.1_all.deb   # bağımlılıkları da kurar
 ```
 
 Hazır paketler [Releases](https://github.com/ahmetemincoban/UbuntuTaskManager/releases) sayfasında.

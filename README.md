@@ -141,7 +141,7 @@ System `python3`, `python3-gi` (GTK 3), `python3-psutil`. The `docker` CLI for t
 
 ```bash
 packaging/build-deb.sh                          # produces dist/tskmngr_<version>_all.deb
-sudo apt install ./dist/tskmngr_1.2.0_all.deb   # also installs the dependencies
+sudo apt install ./dist/tskmngr_1.2.1_all.deb   # also installs the dependencies
 ```
 
 Prebuilt packages are on the [Releases](https://github.com/ahmetemincoban/UbuntuTaskManager/releases) page.
